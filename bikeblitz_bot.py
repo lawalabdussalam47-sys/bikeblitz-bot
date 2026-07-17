@@ -15,6 +15,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
+# Telegram chat ID that receives payment screenshots and order notifications
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "8959243289"))
+
 # Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -31,7 +34,8 @@ logger = logging.getLogger(__name__)
     CHOOSING_ERRAND,
     CONFIRMING_ORDER,
     SCHEDULING_TIME,
-) = range(7)
+    AWAITING_PAYMENT_PROOF,
+) = range(8)
 
 # Pricing
 ZONE_PRICES = {
@@ -538,12 +542,69 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Thank you for choosing BikeBlitz! 🚴"
         )
 
-        await update.message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_menu())
-        context.user_data.clear()
-        return CHOOSING_SERVICE
+        await update.message.reply_text(
+            confirmation,
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+        )
+        return AWAITING_PAYMENT_PROOF
 
     await update.message.reply_text("Please confirm or cancel the order 👇", reply_markup=confirm_keyboard())
     return CONFIRMING_ORDER
+
+
+async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🏠 Main Menu":
+        return await start(update, context)
+
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Please send your payment receipt as a *photo/screenshot* 📸, "
+            "or tap Main Menu to start over.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+        )
+        return AWAITING_PAYMENT_PROOF
+
+    # Build an order summary to send alongside the screenshot
+    user = update.effective_user
+    zone = context.user_data.get("zone", "N/A")
+    service = context.user_data.get("service", "N/A")
+    delivery_type = context.user_data.get("delivery_type", "Standard")
+    total = context.user_data.get("total", 0)
+    weight = context.user_data.get("weight")
+    errand_type = context.user_data.get("errand_type")
+    scheduled_time = context.user_data.get("scheduled_time", "")
+
+    summary = (
+        f"💰 *New Payment Received*\n\n"
+        f"👤 Customer: {user.full_name} (@{user.username or 'no username'})\n"
+        f"🆔 Telegram ID: {user.id}\n"
+        f"🛠️ Service: {service} {f'- {weight}' if weight else ''}{f'- {errand_type}' if errand_type else ''}\n"
+        f"🗺️ Zone: {zone}\n"
+        f"🚴 Delivery Type: {delivery_type}\n"
+    )
+    if scheduled_time:
+        summary += f"📅 Scheduled: {scheduled_time}\n"
+    summary += f"💳 Total: ₦{total:,}"
+
+    # Forward the screenshot + summary to the admin
+    photo_file_id = update.message.photo[-1].file_id
+    await context.bot.send_photo(
+        chat_id=ADMIN_CHAT_ID,
+        photo=photo_file_id,
+        caption=summary,
+        parse_mode="Markdown",
+    )
+
+    await update.message.reply_text(
+        "✅ Payment screenshot received!\n\n"
+        "Your rider will be dispatched shortly ⚡\n\n"
+        "Thank you for choosing BikeBlitz! 🚴",
+        reply_markup=main_menu()
+    )
+    context.user_data.clear()
+    return CHOOSING_SERVICE
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,6 +680,10 @@ def main():
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
             SCHEDULING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_time)],
+            AWAITING_PAYMENT_PROOF: [
+                MessageHandler(filters.PHOTO, handle_payment_proof),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payment_proof),
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
     )
