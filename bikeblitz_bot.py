@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
     CONFIRMING_ORDER,
     SCHEDULING_TIME,
     AWAITING_PAYMENT_PROOF,
-) = range(8)
+    CHOOSING_LOCATION_DETAILS,
+) = range(9)
 
 # Pricing
 ZONE_PRICES = {
@@ -56,9 +57,9 @@ DISTANCE_MODIFIER = 200
 
 ZONE_LOCATIONS = {
     "Zone 1 - On Campus": "Anywhere within FUNAAB campus",
-    "Zone 2 - Near Off Campus": "Harmony, Accord, Zoo, Oluwo, Isolu",
-    "Zone 3 - Mid Off Campus": "Labuta, Camp (from Accord/Zoo/Oluwo/Isolu)",
-    "Zone 4 - Far Off Campus": "Camp (from Harmony), Town",
+    "Zone 2 - Near Off Campus": "Harmony, Accord, Zoo, Agbede, Kofesu",
+    "Zone 3 - Mid Off Campus": "Labuta, Isolu-Cele, Isolu-FUNIS, Camp",
+    "Zone 4 - Far Off Campus": "Town",
 }
 
 
@@ -184,11 +185,11 @@ async def zones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📍 *Zone 1 — On Campus*\n"
         "Anywhere within FUNAAB campus\n\n"
         "📍 *Zone 2 — Near Off Campus*\n"
-        "Harmony, Accord, Zoo, Oluwo, Isolu\n\n"
+        "Harmony, Accord, Zoo, Agbede, Kofesu\n\n"
         "📍 *Zone 3 — Mid Off Campus*\n"
-        "Labuta, Camp (from Accord/Zoo/Oluwo/Isolu)\n\n"
+        "Labuta, Isolu-Cele, Isolu-FUNIS, Camp\n\n"
         "📍 *Zone 4 — Far Off Campus*\n"
-        "Camp (from Harmony), Town and beyond\n\n"
+        "Town\n\n"
         "_Note: A ₦200 distance modifier applies if your location is far from the main bus stop._"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
@@ -430,9 +431,29 @@ async def handle_busstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     far_from_busstop = "Far" in text
     context.user_data["far_from_busstop"] = far_from_busstop
 
+    await update.message.reply_text(
+        "📝 One last thing — please describe your *exact location* within the zone "
+        "(hostel/building name, house number, nearest landmark, etc.) so your rider "
+        "can find you door-to-door.\n\n"
+        "_Example: Alpha Hostel, Room 14, behind the FUNAAB clinic_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+    )
+    return CHOOSING_LOCATION_DETAILS
+
+
+async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    context.user_data["location_details"] = text.strip()
+
+    far_from_busstop = context.user_data.get("far_from_busstop", False)
     zone = context.user_data.get("zone")
     service = context.user_data.get("service", "B2B")
     delivery_type = context.user_data.get("delivery_type", "Standard")
+    location_details = context.user_data.get("location_details", "")
 
     if service == "B2B":
         weight = context.user_data.get("weight")
@@ -450,6 +471,7 @@ async def handle_busstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📋 *Order Summary*\n\n"
             f"📦 Service: Package Delivery\n"
             f"🗺️ Zone: {zone}\n"
+            f"📍 Location: {location_details}\n"
             f"⚖️ Weight: {weight}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
             f"📍 Far from bus stop: {'Yes' if far_from_busstop else 'No'}\n\n"
@@ -484,6 +506,7 @@ async def handle_busstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📋 *Order Summary*\n\n"
             f"🛒 Service: {errand_type}\n"
             f"🗺️ Zone: {zone}\n"
+            f"📍 Location: {location_details}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
             f"📍 Far from bus stop: {'Yes' if far_from_busstop else 'No'}\n\n"
             f"━━━━━━━━━━━━━━━━\n"
@@ -576,6 +599,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     weight = context.user_data.get("weight")
     errand_type = context.user_data.get("errand_type")
     scheduled_time = context.user_data.get("scheduled_time", "")
+    location_details = context.user_data.get("location_details", "Not provided")
 
     summary = (
         f"💰 *New Payment Received*\n\n"
@@ -583,6 +607,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🆔 Telegram ID: {user.id}\n"
         f"🛠️ Service: {service} {f'- {weight}' if weight else ''}{f'- {errand_type}' if errand_type else ''}\n"
         f"🗺️ Zone: {zone}\n"
+        f"📍 Exact location: {location_details}\n"
         f"🚴 Delivery Type: {delivery_type}\n"
     )
     if scheduled_time:
@@ -738,6 +763,7 @@ def main():
             CHOOSING_ZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zone)],
             CHOOSING_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_weight)],
             CHOOSING_BUSSTOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_busstop)],
+            CHOOSING_LOCATION_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_details)],
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
             SCHEDULING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_time)],
