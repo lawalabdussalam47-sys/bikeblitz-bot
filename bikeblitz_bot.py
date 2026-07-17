@@ -1,6 +1,6 @@
 import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -8,6 +8,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ConversationHandler,
+    CallbackQueryHandler,
 )
 
 # Bot token — MUST come from an environment variable. Never hardcode it here.
@@ -588,23 +589,83 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         summary += f"📅 Scheduled: {scheduled_time}\n"
     summary += f"💳 Total: ₦{total:,}"
 
-    # Forward the screenshot + summary to the admin
+    # Forward the screenshot + summary to the admin, with Approve/Reject buttons
     photo_file_id = update.message.photo[-1].file_id
+
+    # Stash order info so the approve/reject handler can message the right customer
+    pending = context.application.bot_data.setdefault("pending_orders", {})
+    pending[str(user.id)] = {
+        "total": total,
+        "delivery_type": delivery_type,
+        "scheduled_time": scheduled_time,
+    }
+
+    approval_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{user.id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject:{user.id}"),
+        ]
+    ])
+
     await context.bot.send_photo(
         chat_id=ADMIN_CHAT_ID,
         photo=photo_file_id,
         caption=summary,
         parse_mode="Markdown",
+        reply_markup=approval_keyboard,
     )
 
     await update.message.reply_text(
-        "✅ Payment screenshot received!\n\n"
-        "Your rider will be dispatched shortly ⚡\n\n"
-        "Thank you for choosing BikeBlitz! 🚴",
+        "📸 Screenshot received!\n\n"
+        "We're verifying your payment now — you'll get a confirmation shortly ⏳",
         reply_markup=main_menu()
     )
     context.user_data.clear()
     return CHOOSING_SERVICE
+
+
+async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, customer_id_str = query.data.split(":", 1)
+    customer_id = int(customer_id_str)
+
+    pending = context.application.bot_data.get("pending_orders", {})
+    order = pending.pop(customer_id_str, None)
+
+    if action == "approve":
+        total = order.get("total", 0) if order else 0
+        delivery_type = order.get("delivery_type", "Standard") if order else "Standard"
+        scheduled_time = order.get("scheduled_time", "") if order else ""
+
+        msg = (
+            "✅ *Payment Confirmed!*\n\n"
+            f"Your delivery charge of ₦{total:,} has been verified.\n\n"
+            "Your rider will be dispatched immediately ⚡\n\n"
+        )
+        if delivery_type == "Scheduled" and scheduled_time:
+            msg += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+        msg += "Thank you for choosing BikeBlitz! 🚴"
+
+        await context.bot.send_message(chat_id=customer_id, text=msg, parse_mode="Markdown")
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + "\n\n✅ *APPROVED*",
+            parse_mode="Markdown",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=customer_id,
+            text=(
+                "⚠️ We couldn't verify your payment screenshot.\n\n"
+                "Please resend a clear screenshot of your transfer, or contact us:\n"
+                "📱 WhatsApp: 08144124522"
+            ),
+        )
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + "\n\n❌ *REJECTED*",
+            parse_mode="Markdown",
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,6 +750,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CommandHandler("zones", zones))
     app.add_handler(CommandHandler("pricing", pricing))
     app.add_handler(CommandHandler("payment", payment))
