@@ -230,9 +230,9 @@ async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4️⃣ Send your receipt screenshot to confirm\n"
         "5️⃣ Your rider moves immediately ⚡\n\n"
         "🏦 *Bank Details:*\n"
-        "Bank: [Your Bank Name]\n"
-        "Account Number: [Your Account Number]\n"
-        "Account Name: BikeBlitz\n\n"
+        "Bank: Moniepoint\n"
+        "Account Number: 8144124522\n"
+        "Account Name: Lawal Abdussalam\n\n"
         "_For B2C orders: item cost is paid directly by you to the vendor when your rider arrives._",
         parse_mode="Markdown",
         reply_markup=main_menu()
@@ -244,8 +244,8 @@ async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📞 *Contact BikeBlitz*\n\n"
         "Need to speak to a team member directly?\n\n"
-        "📱 WhatsApp: [Your WhatsApp Number]\n"
-        "📧 Email: [Your Email]\n"
+        "📱 WhatsApp: 08144124522\n"
+        "📧 Email: lawalabdussalam47@gmail.com\n"
         "📍 Location: FUNAAB Campus, Abeokuta\n\n"
         "🕒 Available daily 9am – 9pm\n\n"
         "_For orders and quotes, use the menu below for faster service._",
@@ -400,7 +400,7 @@ async def handle_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚖️ *Very Heavy Package*\n\n"
             "Packages above 10kg need to be negotiated separately.\n\n"
             "Please contact us directly:\n"
-            "📱 WhatsApp: [Your Number]\n\n"
+            "📱 WhatsApp: 08144124522\n\n"
             "We'll get back to you immediately! ⚡",
             parse_mode="Markdown",
             reply_markup=main_menu()
@@ -523,9 +523,9 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Order Confirmed!*\n\n"
             f"💳 *Total Delivery Charge: ₦{total:,}*\n\n"
             f"Please transfer ₦{total:,} to:\n"
-            f"🏦 Bank: [Your Bank Name]\n"
-            f"🔢 Account: [Your Account Number]\n"
-            f"👤 Name: BikeBlitz\n\n"
+            f"🏦 Bank: Moniepoint\n"
+            f"🔢 Account: 8144124522\n"
+            f"👤 Name: Lawal Abdussalam\n\n"
             f"After payment:\n"
             f"1️⃣ Send your receipt screenshot here\n"
             f"2️⃣ Your rider will be dispatched immediately ⚡\n\n"
@@ -534,7 +534,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             confirmation += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
         confirmation += (
             f"📞 Questions? Contact us:\n"
-            f"WhatsApp: [Your Number]\n\n"
+            f"WhatsApp: 08144124522\n\n"
             f"Thank you for choosing BikeBlitz! 🚴"
         )
 
