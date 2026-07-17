@@ -594,6 +594,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    # Workaround for a known python-telegram-bot issue on some hosts where
+    # asyncio.get_event_loop() fails with "no current event loop in thread
+    # 'MainThread'" even though nothing else touched asyncio yet.
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
