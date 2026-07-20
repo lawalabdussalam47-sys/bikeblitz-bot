@@ -79,19 +79,73 @@ def get_riders_sheet():
 
 
 def log_transaction(customer_name, telegram_id, service, zone, location, delivery_type, total):
-    """Append one approved transaction as a new row. Silently logs errors, never crashes the bot."""
+    """Append one approved transaction as a new row. Returns the sheet row number, or None on failure."""
     try:
         sheet = get_sheet()
         if sheet is None:
             logger.warning("Google Sheets not configured — skipping transaction log")
-            return
+            return None
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([
             timestamp, customer_name, str(telegram_id), service, zone,
-            location, delivery_type, total
+            location, delivery_type, total, "Pending", ""
         ])
+        return len(sheet.get_all_values())
     except Exception:
         logger.exception("Failed to log transaction to Google Sheets")
+        return None
+
+
+def mark_transaction_delivered(sheet_row):
+    """Update a transaction row's Status (col I) and Delivered At (col J) once a rider marks it done."""
+    if not sheet_row:
+        return
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.update(f"I{sheet_row}:J{sheet_row}", [["Delivered", now_str]])
+    except Exception:
+        logger.exception("Failed to update delivery status in Google Sheets")
+
+
+def get_customer_last_order(telegram_id):
+    """Look up the most recent order for a given customer, for the /status command."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return None
+        records = sheet.get_all_records()
+        matches = [r for r in records if str(r.get("Telegram ID", "")) == str(telegram_id)]
+        return matches[-1] if matches else None
+    except Exception:
+        logger.exception("Failed to look up customer order status")
+        return None
+
+
+def get_todays_stats():
+    """Summarize today's orders for the /stats command."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return None
+        records = sheet.get_all_records()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        todays = [r for r in records if str(r.get("Timestamp", "")).startswith(today_str)]
+        total_orders = len(records)
+        total_revenue = sum(int(r.get("Total", 0) or 0) for r in records)
+        today_orders = len(todays)
+        today_revenue = sum(int(r.get("Total", 0) or 0) for r in todays)
+        return {
+            "total_orders": total_orders,
+            "total_revenue": total_revenue,
+            "today_orders": today_orders,
+            "today_revenue": today_revenue,
+        }
+    except Exception:
+        logger.exception("Failed to compute stats")
+        return None
 
 
 def record_rider_delivery(rider_id, rider_name):
@@ -111,6 +165,24 @@ def record_rider_delivery(rider_id, rider_name):
         ws.append_row([rider_name, str(rider_id), 1, now_str])
     except Exception:
         logger.exception("Failed to update rider leaderboard")
+
+
+def record_rider_completion(rider_id):
+    """Increment a rider's completed-delivery count in column E, creating the column if missing."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        if rows and len(rows[0]) < 5:
+            ws.update("E1", [["Completed Deliveries"]])
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                current = int(row[4]) if len(row) > 4 and row[4].isdigit() else 0
+                ws.update(f"E{idx}", [[current + 1]])
+                return
+    except Exception:
+        logger.exception("Failed to update rider completion count")
 
 # Logging
 logging.basicConfig(
@@ -237,6 +309,86 @@ def parse_weight(text):
     elif "Very Heavy" in text:
         return "Very Heavy"
     return None
+
+
+async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, customer_id_str = query.data.split(":", 1)
+
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+
+    if order is None:
+        await query.answer("This order's details are no longer available.", show_alert=True)
+        return
+
+    if order.get("rider_id") != query.from_user.id:
+        await query.answer("Only the rider who claimed this can mark it delivered.", show_alert=True)
+        return
+
+    if order.get("delivered"):
+        await query.answer("Already marked as delivered.")
+        return
+
+    order["delivered"] = True
+    await query.answer("Marked as delivered! ✅")
+
+    await query.edit_message_text(
+        (query.message.text or "") + "\n\n✅ *DELIVERED*",
+        parse_mode="Markdown",
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=order.get("customer_id"),
+            text="✅ Your BikeBlitz order has been delivered! Thanks for choosing us 🚴",
+        )
+    except Exception:
+        logger.exception("Could not notify customer of delivery completion")
+
+    mark_transaction_delivered(order.get("sheet_row"))
+    record_rider_completion(order.get("rider_id"))
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    order = get_customer_last_order(user.id)
+    if order is None:
+        await update.message.reply_text(
+            "We couldn't find any recent orders for you. Place one from the menu below! 👇",
+            reply_markup=main_menu()
+        )
+        return
+
+    status_text = order.get("Status", "Unknown")
+    emoji = "✅" if status_text == "Delivered" else "🚴" if status_text == "Pending" else "❔"
+    msg = (
+        f"{emoji} *Order Status: {status_text}*\n\n"
+        f"🗺️ Zone: {order.get('Zone', 'N/A')}\n"
+        f"📍 Location: {order.get('Location', 'N/A')}\n"
+        f"💳 Total: ₦{order.get('Total', 0):,}\n"
+        f"🕒 Placed: {order.get('Timestamp', 'N/A')}"
+    )
+    if status_text == "Delivered" and order.get("Delivered At"):
+        msg += f"\n✅ Delivered: {order.get('Delivered At')}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # silently ignore — this is admin-only
+
+    data = get_todays_stats()
+    if data is None:
+        await update.message.reply_text("Couldn't load stats right now — try again shortly.")
+        return
+
+    msg = (
+        "📊 *BikeBlitz Stats*\n\n"
+        f"*Today:* {data['today_orders']} orders — ₦{data['today_revenue']:,}\n"
+        f"*All-time:* {data['total_orders']} orders — ₦{data['total_revenue']:,}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -828,7 +980,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown",
         )
 
-        log_transaction(
+        sheet_row = log_transaction(
             customer_name=customer_name,
             telegram_id=customer_id,
             service=service,
@@ -852,6 +1004,8 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             "total": total,
             "rider_id": None,
             "rider_name": None,
+            "sheet_row": sheet_row,
+            "delivered": False,
         }
 
         order_text = (
@@ -941,8 +1095,14 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Please reach out to the customer to confirm pickup/drop-off. Ride safe! 🚴"
     )
 
+    delivered_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Mark as Delivered", callback_data=f"delivered:{customer_id_str}")]
+    ])
+
     try:
-        await context.bot.send_message(chat_id=rider.id, text=detail_text, parse_mode="Markdown")
+        await context.bot.send_message(
+            chat_id=rider.id, text=detail_text, parse_mode="Markdown", reply_markup=delivered_keyboard
+        )
     except Exception:
         logger.exception("Could not DM rider — they may not have started the bot yet")
 
@@ -1042,6 +1202,7 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
+    app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
     app.add_handler(CommandHandler("zones", zones))
     app.add_handler(CommandHandler("pricing", pricing))
     app.add_handler(CommandHandler("payment", payment))
@@ -1049,6 +1210,8 @@ def main():
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("groupid", groupid))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("stats", stats))
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
