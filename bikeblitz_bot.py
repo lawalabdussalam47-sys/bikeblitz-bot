@@ -192,7 +192,15 @@ def parse_weight(text):
     return None
 
 
-# ---------- Core screens ----------
+async def groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"Chat ID: `{chat.id}`\nChat type: {chat.type}",
+        parse_mode="Markdown"
+    )
+
+
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -847,6 +855,7 @@ def main():
     app.add_handler(CommandHandler("payment", payment))
     app.add_handler(CommandHandler("contact", contact))
     app.add_handler(CommandHandler("about", about))
+    app.add_handler(CommandHandler("groupid", groupid))
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
