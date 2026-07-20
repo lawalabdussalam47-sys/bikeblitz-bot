@@ -311,6 +311,38 @@ def parse_weight(text):
     return None
 
 
+def record_rider_status(rider_id, rider_name, availability):
+    """Set a rider's Online/Offline status in column F, creating the rider row if needed."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        if rows and len(rows[0]) < 6:
+            ws.update("F1", [["Availability"]])
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                ws.update(f"F{idx}", [[availability]])
+                return
+        # Rider not in sheet yet — add them with zero counts
+        ws.append_row([rider_name, str(rider_id), 0, "", 0, availability])
+    except Exception:
+        logger.exception("Failed to update rider availability")
+
+
+def get_online_riders():
+    """Return a list of rider names currently marked Online."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return []
+        records = ws.get_all_records()
+        return [r.get("Rider Name", "Unknown") for r in records if r.get("Availability") == "Online"]
+    except Exception:
+        logger.exception("Failed to read online riders")
+        return []
+
+
 async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     _, customer_id_str = query.data.split(":", 1)
@@ -428,6 +460,102 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    record_rider_status(user.id, user.full_name, "Online")
+    await update.message.reply_text("🟢 You're marked as *Online* — you'll be visible for new orders!", parse_mode="Markdown")
+
+
+async def offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    record_rider_status(user.id, user.full_name, "Offline")
+    await update.message.reply_text("🔴 You're marked as *Offline*. Use /online when you're back!", parse_mode="Markdown")
+
+
+async def whosonline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    online_riders = get_online_riders()
+    if not online_riders:
+        await update.message.reply_text("😴 No riders currently marked online.")
+        return
+    lines = ["🟢 *Riders Online Now:*\n"] + [f"• {name}" for name in online_riders]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, customer_id_str = query.data.split(":", 1)
+
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+
+    if order is None:
+        await query.answer("This order can no longer be cancelled.", show_alert=True)
+        return
+
+    if order.get("delivered"):
+        await query.answer("This order has already been delivered and can't be cancelled.", show_alert=True)
+        return
+
+    if order.get("cancelled"):
+        await query.answer("Already cancelled.")
+        return
+
+    order["cancelled"] = True
+    await query.answer("Order cancelled.")
+
+    await query.edit_message_text(
+        (query.message.text or "") + "\n\n❌ *ORDER CANCELLED*",
+        parse_mode="Markdown",
+    )
+
+    # Update the sheet status
+    try:
+        sheet = get_sheet()
+        row = order.get("sheet_row")
+        if sheet and row:
+            sheet.update(f"I{row}", [["Cancelled"]])
+    except Exception:
+        logger.exception("Failed to update cancelled status in sheet")
+
+    # Notify admin — a refund likely needs manual handling
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"⚠️ *Order Cancelled by Customer*\n\n"
+                f"👤 {order.get('customer_name')}\n"
+                f"💳 ₦{order.get('total', 0):,}\n\n"
+                f"A refund may need to be processed manually."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to notify admin of cancellation")
+
+    # If a rider had already claimed it, let them know it's off
+    rider_id = order.get("rider_id")
+    if rider_id:
+        try:
+            await context.bot.send_message(
+                chat_id=rider_id,
+                text="❌ This delivery was cancelled by the customer. No action needed — sorry for the trouble!",
+            )
+        except Exception:
+            logger.exception("Failed to notify rider of cancellation")
+
+    # If not yet claimed, remove the button from the rider group broadcast
+    broadcast_id = order.get("broadcast_message_id")
+    if broadcast_id and not rider_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=RIDER_GROUP_CHAT_ID,
+                message_id=broadcast_id,
+                text="❌ This order was cancelled by the customer before being claimed.",
+            )
+        except Exception:
+            logger.exception("Failed to update rider group broadcast after cancellation")
+
+
 async def groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(
@@ -440,9 +568,23 @@ async def groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    user = update.effective_user
+    last_order = get_customer_last_order(user.id)
+
+    if last_order:
+        last_zone = last_order.get("Zone", "")
+        greeting = (
+            f"👋 Welcome back to *BikeBlitz*, {user.first_name}! 🚴\n\n"
+            f"Last time you ordered in *{last_zone}* — same zone today, or something new?\n\n"
+        )
+    else:
+        greeting = (
+            "👋 Welcome to *BikeBlitz* 🚴\n\n"
+            "FUNAAB's fastest campus delivery and errand service.\n\n"
+        )
+
     await update.message.reply_text(
-        "👋 Welcome to *BikeBlitz* 🚴\n\n"
-        "FUNAAB's fastest campus delivery and errand service.\n\n"
+        greeting +
         "🕒 *Operating Hours:* Daily 9am – 9pm\n"
         "🌙 *Same-day cut-off:* 8pm\n\n"
         "Fast. Reliable. Zero silence. Every order.\n\n"
@@ -974,7 +1116,10 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             msg += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
         msg += "Thank you for choosing BikeBlitz! 🚴"
 
-        await context.bot.send_message(chat_id=customer_id, text=msg, parse_mode="Markdown")
+        cancel_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel Order", callback_data=f"cancelorder:{customer_id}")]
+        ])
+        await context.bot.send_message(chat_id=customer_id, text=msg, parse_mode="Markdown", reply_markup=cancel_keyboard)
         await query.edit_message_caption(
             caption=(query.message.caption or "") + "\n\n✅ *APPROVED*",
             parse_mode="Markdown",
@@ -1026,12 +1171,13 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         ])
 
         try:
-            await context.bot.send_message(
+            broadcast_msg = await context.bot.send_message(
                 chat_id=RIDER_GROUP_CHAT_ID,
                 text=order_text,
                 parse_mode="Markdown",
                 reply_markup=claim_keyboard,
             )
+            claimed_orders[customer_id_str]["broadcast_message_id"] = broadcast_msg.message_id
         except Exception:
             logger.exception("Failed to broadcast order to rider group")
     else:
@@ -1203,6 +1349,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
     app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_order, pattern=r"^cancelorder:"))
     app.add_handler(CommandHandler("zones", zones))
     app.add_handler(CommandHandler("pricing", pricing))
     app.add_handler(CommandHandler("payment", payment))
@@ -1212,6 +1359,9 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("online", online))
+    app.add_handler(CommandHandler("offline", offline))
+    app.add_handler(CommandHandler("whosonline", whosonline))
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
