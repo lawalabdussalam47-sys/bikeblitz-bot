@@ -1,5 +1,7 @@
 import os
+import json
 import logging
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -18,6 +20,50 @@ if not TOKEN:
 
 # Telegram chat ID that receives payment screenshots and order notifications
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "8959243289"))
+
+# --- Google Sheets transaction logging ---
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+_gsheet = None
+
+
+def get_sheet():
+    """Lazily connect to the Google Sheet. Returns None if not configured or on error."""
+    global _gsheet
+    if _gsheet is not None:
+        return _gsheet
+    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        _gsheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return _gsheet
+    except Exception:
+        logger.exception("Failed to connect to Google Sheets")
+        return None
+
+
+def log_transaction(customer_name, telegram_id, service, zone, location, delivery_type, total):
+    """Append one approved transaction as a new row. Silently logs errors, never crashes the bot."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            logger.warning("Google Sheets not configured — skipping transaction log")
+            return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([
+            timestamp, customer_name, str(telegram_id), service, zone,
+            location, delivery_type, total
+        ])
+    except Exception:
+        logger.exception("Failed to log transaction to Google Sheets")
 
 # Logging
 logging.basicConfig(
@@ -618,11 +664,16 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     photo_file_id = update.message.photo[-1].file_id
 
     # Stash order info so the approve/reject handler can message the right customer
+    # and log the transaction once approved
     pending = context.application.bot_data.setdefault("pending_orders", {})
     pending[str(user.id)] = {
+        "customer_name": user.full_name,
         "total": total,
         "delivery_type": delivery_type,
         "scheduled_time": scheduled_time,
+        "service": service,
+        "zone": zone,
+        "location": location_details,
     }
 
     approval_keyboard = InlineKeyboardMarkup([
@@ -660,9 +711,13 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
     order = pending.pop(customer_id_str, None)
 
     if action == "approve":
+        customer_name = order.get("customer_name", "Unknown") if order else "Unknown"
         total = order.get("total", 0) if order else 0
         delivery_type = order.get("delivery_type", "Standard") if order else "Standard"
         scheduled_time = order.get("scheduled_time", "") if order else ""
+        service = order.get("service", "N/A") if order else "N/A"
+        zone = order.get("zone", "N/A") if order else "N/A"
+        location = order.get("location", "N/A") if order else "N/A"
 
         msg = (
             "✅ *Payment Confirmed!*\n\n"
@@ -677,6 +732,16 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_caption(
             caption=(query.message.caption or "") + "\n\n✅ *APPROVED*",
             parse_mode="Markdown",
+        )
+
+        log_transaction(
+            customer_name=customer_name,
+            telegram_id=customer_id,
+            service=service,
+            zone=zone,
+            location=location,
+            delivery_type=delivery_type,
+            total=total,
         )
     else:
         await context.bot.send_message(
