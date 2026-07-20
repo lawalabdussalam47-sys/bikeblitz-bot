@@ -311,6 +311,38 @@ def parse_weight(text):
     return None
 
 
+def record_rating(customer_name, rider_name, rider_id, stars):
+    """Append a delivery rating to the 'Ratings' worksheet, creating it if missing."""
+    try:
+        ss = get_spreadsheet()
+        if ss is None:
+            return
+        import gspread
+        try:
+            ws = ss.worksheet("Ratings")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Ratings", rows=500, cols=5)
+            ws.append_row(["Timestamp", "Customer Name", "Rider Name", "Rider ID", "Stars"])
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([timestamp, customer_name, rider_name, str(rider_id), stars])
+    except Exception:
+        logger.exception("Failed to record rating")
+
+
+def get_all_customer_ids():
+    """Return a sorted list of unique customer Telegram IDs from the Transactions sheet."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return []
+        records = sheet.get_all_records()
+        ids = {str(r.get("Telegram ID")) for r in records if r.get("Telegram ID")}
+        return list(ids)
+    except Exception:
+        logger.exception("Failed to fetch customer IDs for broadcast")
+        return []
+
+
 def record_rider_status(rider_id, rider_name, availability):
     """Set a rider's Online/Offline status in column F, creating the rider row if needed."""
     try:
@@ -362,24 +394,98 @@ async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Already marked as delivered.")
         return
 
-    order["delivered"] = True
-    await query.answer("Marked as delivered! ✅")
+    # Ask the rider for a proof photo instead of finalizing immediately
+    awaiting = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
+    awaiting[query.from_user.id] = customer_id_str
 
-    await query.edit_message_text(
-        (query.message.text or "") + "\n\n✅ *DELIVERED*",
-        parse_mode="Markdown",
+    await query.answer("Almost done!")
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="📸 Please send a photo of the delivered package/drop-off as proof to complete this order.",
     )
 
+
+async def handle_delivery_proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global photo handler — only acts if the sender is a rider currently submitting delivery proof."""
+    rider_id = update.effective_user.id
+    awaiting = context.application.bot_data.get("awaiting_delivery_proof", {})
+    customer_id_str = awaiting.get(rider_id)
+    if not customer_id_str:
+        return  # not a rider mid-proof-submission — ignore, let other handlers process it
+
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+    if order is None:
+        awaiting.pop(rider_id, None)
+        return
+
+    awaiting.pop(rider_id, None)
+    order["delivered"] = True
+
+    photo_file_id = update.message.photo[-1].file_id
+    rider_name = order.get("rider_name", "Your rider")
+
+    await update.message.reply_text("✅ Delivery confirmed! Thanks for the proof — great work 🚴")
+
+    # Forward proof photo + rating request to the customer
+    rating_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(n), callback_data=f"rate:{n}:{rider_id}:{customer_id_str}")
+        for n in range(1, 6)
+    ]])
     try:
-        await context.bot.send_message(
+        await context.bot.send_photo(
             chat_id=order.get("customer_id"),
-            text="✅ Your BikeBlitz order has been delivered! Thanks for choosing us 🚴",
+            photo=photo_file_id,
+            caption=(
+                "✅ Your BikeBlitz order has been delivered! Thanks for choosing us 🚴\n\n"
+                f"How was your rider, {rider_name}? Rate your delivery 👇"
+            ),
+            reply_markup=rating_keyboard,
         )
     except Exception:
         logger.exception("Could not notify customer of delivery completion")
 
+    # Forward proof to admin too
+    try:
+        await context.bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=photo_file_id,
+            caption=f"📦 Delivery proof — {order.get('customer_name')} — ₦{order.get('total', 0):,}",
+        )
+    except Exception:
+        logger.exception("Could not forward delivery proof to admin")
+
     mark_transaction_delivered(order.get("sheet_row"))
-    record_rider_completion(order.get("rider_id"))
+    record_rider_completion(rider_id)
+
+
+async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, stars_str, rider_id_str, customer_id_str = query.data.split(":", 3)
+    stars = int(stars_str)
+
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str, {})
+    customer_name = order.get("customer_name", "A customer")
+    rider_name = order.get("rider_name", "Unknown rider")
+
+    record_rating(customer_name, rider_name, rider_id_str, stars)
+
+    await query.answer(f"Thanks for the {stars}⭐ rating!")
+    try:
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + f"\n\nYou rated this delivery {stars}⭐. Thank you!",
+        )
+    except Exception:
+        pass
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(rider_id_str),
+            text=f"⭐ You just received a {stars}-star rating from {customer_name}!",
+        )
+    except Exception:
+        logger.exception("Could not notify rider of rating")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,6 +576,34 @@ async def offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     record_rider_status(user.id, user.full_name, "Offline")
     await update.message.reply_text("🔴 You're marked as *Offline*. Use /online when you're back!", parse_mode="Markdown")
+
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    message_text = update.message.text.partition(" ")[2].strip()
+    if not message_text:
+        await update.message.reply_text(
+            "Usage: `/broadcast Your message here` — sends to every past customer.",
+            parse_mode="Markdown"
+        )
+        return
+
+    customer_ids = get_all_customer_ids()
+    if not customer_ids:
+        await update.message.reply_text("No customers found to broadcast to yet.")
+        return
+
+    sent, failed = 0, 0
+    for cid in customer_ids:
+        try:
+            await context.bot.send_message(chat_id=int(cid), text=f"📢 {message_text}")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"📤 Broadcast sent to {sent} customers. ({failed} unreachable)")
 
 
 async def whosonline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1350,6 +1484,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
     app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
     app.add_handler(CallbackQueryHandler(handle_cancel_order, pattern=r"^cancelorder:"))
+    app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^rate:"))
     app.add_handler(CommandHandler("zones", zones))
     app.add_handler(CommandHandler("pricing", pricing))
     app.add_handler(CommandHandler("payment", payment))
@@ -1362,6 +1497,11 @@ def main():
     app.add_handler(CommandHandler("online", online))
     app.add_handler(CommandHandler("offline", offline))
     app.add_handler(CommandHandler("whosonline", whosonline))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+
+    # Global handler (separate group) — catches delivery proof photos from riders
+    # regardless of what conversation state the customer-facing flow is in.
+    app.add_handler(MessageHandler(filters.PHOTO, handle_delivery_proof_photo), group=1)
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
