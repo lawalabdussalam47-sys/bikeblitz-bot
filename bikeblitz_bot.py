@@ -28,14 +28,15 @@ RIDER_GROUP_CHAT_ID = int(os.environ.get("RIDER_GROUP_CHAT_ID", "-5358898377"))
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-_gsheet = None
+_gsheet_client = None
+_spreadsheet = None
 
 
-def get_sheet():
-    """Lazily connect to the Google Sheet. Returns None if not configured or on error."""
-    global _gsheet
-    if _gsheet is not None:
-        return _gsheet
+def get_spreadsheet():
+    """Lazily connect to the Google Sheet workbook. Returns None if not configured or on error."""
+    global _gsheet_client, _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
     if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
@@ -45,11 +46,35 @@ def get_sheet():
         creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        _gsheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        return _gsheet
+        _gsheet_client = gspread.authorize(creds)
+        _spreadsheet = _gsheet_client.open_by_key(GOOGLE_SHEET_ID)
+        return _spreadsheet
     except Exception:
         logger.exception("Failed to connect to Google Sheets")
+        return None
+
+
+def get_sheet():
+    """Returns the main transactions worksheet (first tab)."""
+    ss = get_spreadsheet()
+    return ss.sheet1 if ss else None
+
+
+def get_riders_sheet():
+    """Returns the 'Riders' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Riders")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Riders", rows=200, cols=4)
+            ws.append_row(["Rider Name", "Telegram ID", "Deliveries Claimed", "Last Delivery"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Riders worksheet")
         return None
 
 
@@ -67,6 +92,25 @@ def log_transaction(customer_name, telegram_id, service, zone, location, deliver
         ])
     except Exception:
         logger.exception("Failed to log transaction to Google Sheets")
+
+
+def record_rider_delivery(rider_id, rider_name):
+    """Increment a rider's claimed-delivery count, or add them if it's their first."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            logger.warning("Google Sheets not configured — skipping rider leaderboard update")
+            return
+        rows = ws.get_all_values()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                current_count = int(row[2]) if len(row) > 2 and row[2].isdigit() else 0
+                ws.update(f"A{idx}:D{idx}", [[rider_name, str(rider_id), current_count + 1, now_str]])
+                return
+        ws.append_row([rider_name, str(rider_id), 1, now_str])
+    except Exception:
+        logger.exception("Failed to update rider leaderboard")
 
 # Logging
 logging.basicConfig(
@@ -193,6 +237,43 @@ def parse_weight(text):
     elif "Very Heavy" in text:
         return "Very Heavy"
     return None
+
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ws = get_riders_sheet()
+    if ws is None:
+        await update.message.reply_text("📊 Leaderboard isn't set up yet — check back soon!")
+        return
+
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        logger.exception("Failed to read Riders worksheet for leaderboard")
+        await update.message.reply_text("Couldn't load the leaderboard right now, try again shortly.")
+        return
+
+    if not records:
+        await update.message.reply_text("🏆 No deliveries logged yet — be the first to claim one!")
+        return
+
+    def _count(r):
+        try:
+            return int(r.get("Deliveries Claimed", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    sorted_riders = sorted(records, key=_count, reverse=True)
+    top = sorted_riders[:10]
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 *BikeBlitz Rider Leaderboard*\n"]
+    for i, r in enumerate(top):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        name = r.get("Rider Name", "Unknown")
+        count = _count(r)
+        lines.append(f"{prefix} {name} — {count} deliver{'y' if count == 1 else 'ies'}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -833,6 +914,8 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order["rider_id"] = rider.id
     order["rider_name"] = rider.full_name
 
+    record_rider_delivery(rider.id, rider.full_name)
+
     await query.answer("You've got this delivery! Check your DM for details.")
 
     await query.edit_message_text(
@@ -965,6 +1048,7 @@ def main():
     app.add_handler(CommandHandler("contact", contact))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("groupid", groupid))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
