@@ -21,6 +21,9 @@ if not TOKEN:
 # Telegram chat ID that receives payment screenshots and order notifications
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "8959243289"))
 
+# Telegram group chat ID where confirmed orders are broadcast to riders
+RIDER_GROUP_CHAT_ID = int(os.environ.get("RIDER_GROUP_CHAT_ID", "-5358898377"))
+
 # --- Google Sheets transaction logging ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -676,6 +679,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     pending = context.application.bot_data.setdefault("pending_orders", {})
     pending[str(user.id)] = {
         "customer_name": user.full_name,
+        "customer_username": user.username,
         "total": total,
         "delivery_type": delivery_type,
         "scheduled_time": scheduled_time,
@@ -720,6 +724,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "approve":
         customer_name = order.get("customer_name", "Unknown") if order else "Unknown"
+        customer_username = order.get("customer_username") if order else None
         total = order.get("total", 0) if order else 0
         delivery_type = order.get("delivery_type", "Standard") if order else "Standard"
         scheduled_time = order.get("scheduled_time", "") if order else ""
@@ -751,6 +756,49 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             delivery_type=delivery_type,
             total=total,
         )
+
+        # Stash order details for the claim handler, then broadcast to riders
+        claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
+        claimed_orders[customer_id_str] = {
+            "customer_name": customer_name,
+            "customer_username": customer_username,
+            "customer_id": customer_id,
+            "service": service,
+            "zone": zone,
+            "location": location,
+            "delivery_type": delivery_type,
+            "scheduled_time": scheduled_time,
+            "total": total,
+            "rider_id": None,
+            "rider_name": None,
+        }
+
+        order_text = (
+            "🚴 *New Order Available!*\n\n"
+            f"🛠️ Service: {service}\n"
+            f"🗺️ Zone: {zone}\n"
+            f"📍 Location: {location}\n"
+            f"🚴 Delivery Type: {delivery_type}\n"
+        )
+        if scheduled_time:
+            order_text += f"📅 Scheduled: {scheduled_time}\n"
+        order_text += f"💳 Total: ₦{total:,}\n"
+        order_text += f"👤 Rider earns: ₦{int(total * 0.7):,} (70%)\n\n"
+        order_text += "First to accept gets this delivery 👇"
+
+        claim_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Accept", callback_data=f"claim:{customer_id}")]
+        ])
+
+        try:
+            await context.bot.send_message(
+                chat_id=RIDER_GROUP_CHAT_ID,
+                text=order_text,
+                parse_mode="Markdown",
+                reply_markup=claim_keyboard,
+            )
+        except Exception:
+            logger.exception("Failed to broadcast order to rider group")
     else:
         await context.bot.send_message(
             chat_id=customer_id,
@@ -764,6 +812,66 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             caption=(query.message.caption or "") + "\n\n❌ *REJECTED*",
             parse_mode="Markdown",
         )
+
+
+async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    _, customer_id_str = query.data.split(":", 1)
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+
+    if order is None:
+        await query.answer("This order no longer exists.", show_alert=True)
+        return
+
+    if order.get("rider_id") is not None:
+        await query.answer(f"Already claimed by {order.get('rider_name')}.", show_alert=True)
+        return
+
+    rider = query.from_user
+    order["rider_id"] = rider.id
+    order["rider_name"] = rider.full_name
+
+    await query.answer("You've got this delivery! Check your DM for details.")
+
+    await query.edit_message_text(
+        (query.message.text or "") + f"\n\n✅ *Claimed by {rider.full_name}*",
+        parse_mode="Markdown",
+    )
+
+    customer_username = order.get("customer_username")
+    customer_contact = f"@{customer_username}" if customer_username else f"Telegram ID {order.get('customer_id')}"
+
+    detail_text = (
+        "📦 *Delivery Details*\n\n"
+        f"🛠️ Service: {order.get('service')}\n"
+        f"🗺️ Zone: {order.get('zone')}\n"
+        f"📍 Location: {order.get('location')}\n"
+        f"🚴 Delivery Type: {order.get('delivery_type')}\n"
+    )
+    if order.get("scheduled_time"):
+        detail_text += f"📅 Scheduled: {order.get('scheduled_time')}\n"
+    detail_text += (
+        f"💳 Total: ₦{order.get('total', 0):,}\n"
+        f"👤 Customer: {order.get('customer_name')} ({customer_contact})\n\n"
+        "Please reach out to the customer to confirm pickup/drop-off. Ride safe! 🚴"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=rider.id, text=detail_text, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Could not DM rider — they may not have started the bot yet")
+
+    # Let the customer know a rider has been assigned
+    try:
+        await context.bot.send_message(
+            chat_id=order.get("customer_id"),
+            text=f"🚴 Your rider *{rider.full_name}* has been assigned and will reach out shortly!",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Could not notify customer of rider assignment")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -850,6 +958,7 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
     app.add_handler(CommandHandler("zones", zones))
     app.add_handler(CommandHandler("pricing", pricing))
     app.add_handler(CommandHandler("payment", payment))
