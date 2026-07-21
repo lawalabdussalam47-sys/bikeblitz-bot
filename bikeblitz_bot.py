@@ -3,6 +3,11 @@ import json
 import logging
 from datetime import datetime, timedelta, time as dt_time
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.import os
+import json
+import logging
+from datetime import datetime, timedelta, time as dt_time
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -579,6 +584,20 @@ async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Could not notify rider of rating")
 
 
+def get_customer_orders(telegram_id, limit=5):
+    """Return a customer's most recent orders (up to limit), most recent first."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return []
+        records = sheet.get_all_records()
+        matches = [r for r in records if str(r.get("Telegram ID", "")) == str(telegram_id)]
+        return list(reversed(matches))[:limit]
+    except Exception:
+        logger.exception("Failed to fetch customer order history")
+        return []
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     order = get_customer_last_order(user.id)
@@ -601,6 +620,26 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status_text == "Delivered" and order.get("Delivered At"):
         msg += f"\n✅ Delivered: {order.get('Delivered At')}"
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    orders = get_customer_orders(user.id, limit=5)
+    if not orders:
+        await update.message.reply_text(
+            "No past orders found. Place your first one from the menu below! 👇",
+            reply_markup=main_menu()
+        )
+        return
+
+    lines = ["📋 *Your Recent Orders*\n"]
+    for o in orders:
+        status_emoji = "✅" if o.get("Status") == "Delivered" else "🚴" if o.get("Status") == "Pending" else "❌" if o.get("Status") == "Cancelled" else "❔"
+        lines.append(
+            f"{status_emoji} {o.get('Timestamp', 'N/A')} — {o.get('Zone', 'N/A')} — "
+            f"₦{o.get('Total', 0):,} ({o.get('Status', 'Unknown')})"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1108,13 +1147,22 @@ async def handle_busstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     far_from_busstop = "Far" in text
     context.user_data["far_from_busstop"] = far_from_busstop
 
+    user = update.effective_user
+    last_order = get_customer_last_order(user.id)
+    last_location = last_order.get("Location") if last_order else None
+
+    keyboard_rows = []
+    if last_location:
+        keyboard_rows.append([KeyboardButton(f"📍 Use last: {last_location}")])
+    keyboard_rows.append([KeyboardButton("🏠 Main Menu")])
+
     await update.message.reply_text(
         "📝 One last thing — please describe your *exact location* within the zone "
         "(hostel/building name, house number, nearest landmark, etc.) so your rider "
         "can find you door-to-door.\n\n"
         "_Example: Alpha Hostel, Room 14, behind the FUNAAB clinic_",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup(keyboard_rows, resize_keyboard=True)
     )
     return CHOOSING_LOCATION_DETAILS
 
@@ -1123,6 +1171,8 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
     text = update.message.text
     if text == "🏠 Main Menu":
         return await start(update, context)
+    if text.startswith("📍 Use last: "):
+        text = text[len("📍 Use last: "):]
 
     context.user_data["location_details"] = text.strip()
 
@@ -1223,6 +1273,25 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = context.user_data.get("total", 0)
         delivery_type = context.user_data.get("delivery_type", "Standard")
         scheduled_time = context.user_data.get("scheduled_time", "")
+        zone = context.user_data.get("zone")
+        service = context.user_data.get("service")
+
+        # Duplicate-order protection — catch accidental double submissions
+        user_id = update.effective_user.id
+        recent = context.application.bot_data.setdefault("recent_confirmations", {})
+        prev = recent.get(user_id)
+        if prev and not context.user_data.get("duplicate_confirmed"):
+            prev_time, prev_zone, prev_service, prev_total = prev
+            if (datetime.now() - prev_time).total_seconds() < 90 and prev_zone == zone and prev_service == service and prev_total == total:
+                context.user_data["duplicate_confirmed"] = True
+                await update.message.reply_text(
+                    "⚠️ You just placed a very similar order less than 2 minutes ago.\n\n"
+                    "Tap *✅ Confirm Order* again if this is intentional (e.g. a second package).",
+                    parse_mode="Markdown",
+                    reply_markup=confirm_keyboard()
+                )
+                return CONFIRMING_ORDER
+        recent[user_id] = (datetime.now(), zone, service, total)
 
         confirmation = (
             f"✅ *Order Confirmed!*\n\n"
@@ -1663,6 +1732,7 @@ def main():
     app.add_handler(CommandHandler("groupid", groupid))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("myorders", myorders))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("online", online))
     app.add_handler(CommandHandler("offline", offline))
