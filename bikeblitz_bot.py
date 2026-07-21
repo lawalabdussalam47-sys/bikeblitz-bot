@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -23,6 +23,9 @@ ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "8959243289"))
 
 # Telegram group chat ID where confirmed orders are broadcast to riders
 RIDER_GROUP_CHAT_ID = int(os.environ.get("RIDER_GROUP_CHAT_ID", "-5358898377"))
+
+# How long an order can sit unclaimed before we alert everyone
+UNCLAIMED_ALERT_MINUTES = int(os.environ.get("UNCLAIMED_ALERT_MINUTES", "10"))
 
 # --- Google Sheets transaction logging ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
@@ -1312,6 +1315,14 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=claim_keyboard,
             )
             claimed_orders[customer_id_str]["broadcast_message_id"] = broadcast_msg.message_id
+
+            if context.job_queue is not None:
+                context.job_queue.run_once(
+                    check_unclaimed_order,
+                    when=timedelta(minutes=UNCLAIMED_ALERT_MINUTES),
+                    data=customer_id_str,
+                    name=f"unclaimed_{customer_id_str}",
+                )
         except Exception:
             logger.exception("Failed to broadcast order to rider group")
     else:
@@ -1327,6 +1338,57 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             caption=(query.message.caption or "") + "\n\n❌ *REJECTED*",
             parse_mode="Markdown",
         )
+
+
+async def check_unclaimed_order(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job — fires if an order sits unclaimed past the alert threshold."""
+    customer_id_str = context.job.data
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+
+    if order is None:
+        return  # order data is gone entirely, nothing to do
+    if order.get("rider_id") or order.get("cancelled") or order.get("delivered"):
+        return  # already handled, no action needed
+
+    zone = order.get("zone", "N/A")
+    location = order.get("location", "N/A")
+    total = order.get("total", 0)
+
+    # Ping the rider group again, referencing the original broadcast if possible
+    alert_text = (
+        f"⏰ *Still Unclaimed!* This order has been waiting {UNCLAIMED_ALERT_MINUTES}+ minutes.\n\n"
+        f"🗺️ Zone: {zone}\n"
+        f"📍 Location: {location}\n"
+        f"💳 Total: ₦{total:,}\n\n"
+        "Can anyone take this? 🙏"
+    )
+    try:
+        broadcast_id = order.get("broadcast_message_id")
+        await context.bot.send_message(
+            chat_id=RIDER_GROUP_CHAT_ID,
+            text=alert_text,
+            parse_mode="Markdown",
+            reply_to_message_id=broadcast_id if broadcast_id else None,
+        )
+    except Exception:
+        logger.exception("Failed to send unclaimed-order reminder to rider group")
+
+    # Let the admin know directly, in case manual intervention is needed
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"⚠️ *Order Unclaimed After {UNCLAIMED_ALERT_MINUTES} Minutes*\n\n"
+                f"👤 {order.get('customer_name')}\n"
+                f"🗺️ {zone} — {location}\n"
+                f"💳 ₦{total:,}\n\n"
+                "You may want to check in with riders directly."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to alert admin of unclaimed order")
 
 
 async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
