@@ -293,7 +293,8 @@ logger = logging.getLogger(__name__)
     SCHEDULING_TIME,
     AWAITING_PAYMENT_PROOF,
     CHOOSING_LOCATION_DETAILS,
-) = range(9)
+    AWAITING_SUPPORT_MESSAGE,
+) = range(10)
 
 # Pricing
 ZONE_PRICES = {
@@ -328,6 +329,7 @@ def main_menu():
         [KeyboardButton("💰 Price Quote"), KeyboardButton("🗺️ View Zones")],
         [KeyboardButton("💳 Payment Info"), KeyboardButton("📞 Contact Us")],
         [KeyboardButton("ℹ️ About BikeBlitz")],
+        [KeyboardButton("🆘 Report an Issue")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1670,12 +1672,50 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await contact(update, context)
     elif text == "ℹ️ About BikeBlitz":
         return await about(update, context)
+    elif text == "🆘 Report an Issue":
+        await update.message.reply_text(
+            "🆘 *We're here to help.*\n\n"
+            "Please describe what's wrong — a late delivery, a rude rider, a payment issue, "
+            "anything at all. This goes straight to our team.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+        )
+        return AWAITING_SUPPORT_MESSAGE
     else:
         await update.message.reply_text(
             "I didn't understand that. Please use the menu below 👇",
             reply_markup=main_menu()
         )
         return CHOOSING_SERVICE
+
+
+async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    user = update.effective_user
+    contact = f"@{user.username}" if user.username else f"Telegram ID {user.id}"
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"🆘 *Support Request*\n\n"
+                f"👤 {user.full_name} ({contact})\n\n"
+                f"\"{text}\""
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to forward support message to admin")
+
+    await update.message.reply_text(
+        "✅ Got it — we've received your message and will get back to you shortly.\n\n"
+        "Thanks for your patience! 🙏",
+        reply_markup=main_menu()
+    )
+    return CHOOSING_SERVICE
 
 
 def main():
@@ -1702,6 +1742,7 @@ def main():
             CHOOSING_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_weight)],
             CHOOSING_BUSSTOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_busstop)],
             CHOOSING_LOCATION_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_details)],
+            AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message)],
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
             SCHEDULING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_time)],
