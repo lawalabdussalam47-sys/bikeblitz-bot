@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -151,6 +151,73 @@ def get_todays_stats():
         return None
 
 
+def get_week_stats():
+    """Summarize the last 7 days of orders, and the top rider by completions, for the weekly summary."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return None
+        records = sheet.get_all_records()
+        cutoff = datetime.now() - timedelta(days=7)
+        week_records = []
+        for r in records:
+            try:
+                ts = datetime.strptime(str(r.get("Timestamp", "")), "%Y-%m-%d %H:%M:%S")
+                if ts >= cutoff:
+                    week_records.append(r)
+            except ValueError:
+                continue
+
+        week_orders = len(week_records)
+        week_revenue = sum(int(r.get("Total", 0) or 0) for r in week_records)
+
+        zone_counts = {}
+        for r in week_records:
+            z = r.get("Zone", "N/A")
+            zone_counts[z] = zone_counts.get(z, 0) + 1
+        busiest_zone = max(zone_counts, key=zone_counts.get) if zone_counts else "N/A"
+
+        top_rider_name, top_rider_count = "N/A", 0
+        ws = get_riders_sheet()
+        if ws is not None:
+            rider_records = ws.get_all_records()
+            for r in rider_records:
+                completed = int(r.get("Completed Deliveries", 0) or 0)
+                if completed > top_rider_count:
+                    top_rider_count = completed
+                    top_rider_name = r.get("Rider Name", "N/A")
+
+        return {
+            "week_orders": week_orders,
+            "week_revenue": week_revenue,
+            "busiest_zone": busiest_zone,
+            "top_rider_name": top_rider_name,
+            "top_rider_count": top_rider_count,
+        }
+    except Exception:
+        logger.exception("Failed to compute weekly stats")
+        return None
+
+
+async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job — posts a weekly recap to the admin every Sunday night."""
+    data = get_week_stats()
+    if data is None:
+        return
+    msg = (
+        "📊 *BikeBlitz Weekly Recap*\n\n"
+        f"📦 Orders this week: {data['week_orders']}\n"
+        f"💳 Revenue this week: ₦{data['week_revenue']:,}\n"
+        f"🗺️ Busiest zone: {data['busiest_zone']}\n"
+        f"🏆 Top rider: {data['top_rider_name']} ({data['top_rider_count']} deliveries)\n\n"
+        "Have a great week ahead! 🚴"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Failed to send weekly summary")
+
+
 def record_rider_delivery(rider_id, rider_name):
     """Increment a rider's claimed-delivery count, or add them if it's their first."""
     try:
@@ -170,8 +237,8 @@ def record_rider_delivery(rider_id, rider_name):
         logger.exception("Failed to update rider leaderboard")
 
 
-def record_rider_completion(rider_id):
-    """Increment a rider's completed-delivery count in column E, creating the column if missing."""
+def record_rider_completion(rider_id, order_total=0):
+    """Increment a rider's completed-delivery count (col E) and cumulative earnings (col G)."""
     try:
         ws = get_riders_sheet()
         if ws is None:
@@ -179,13 +246,34 @@ def record_rider_completion(rider_id):
         rows = ws.get_all_values()
         if rows and len(rows[0]) < 5:
             ws.update("E1", [["Completed Deliveries"]])
+        if rows and len(rows[0]) < 7:
+            ws.update("G1", [["Total Earnings"]])
+        rider_earning = int(order_total * 0.7)
         for idx, row in enumerate(rows[1:], start=2):
             if len(row) > 1 and row[1] == str(rider_id):
-                current = int(row[4]) if len(row) > 4 and row[4].isdigit() else 0
-                ws.update(f"E{idx}", [[current + 1]])
+                current_count = int(row[4]) if len(row) > 4 and row[4].isdigit() else 0
+                current_earnings = int(row[6]) if len(row) > 6 and row[6].isdigit() else 0
+                ws.update(f"E{idx}", [[current_count + 1]])
+                ws.update(f"G{idx}", [[current_earnings + rider_earning]])
                 return
     except Exception:
         logger.exception("Failed to update rider completion count")
+
+
+def get_rider_stats(rider_id):
+    """Fetch one rider's completed count and total earnings, for /myearnings."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return None
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(rider_id):
+                return r
+        return None
+    except Exception:
+        logger.exception("Failed to fetch rider stats")
+        return None
 
 # Logging
 logging.basicConfig(
@@ -459,7 +547,7 @@ async def handle_delivery_proof_photo(update: Update, context: ContextTypes.DEFA
         logger.exception("Could not forward delivery proof to admin")
 
     mark_transaction_delivered(order.get("sheet_row"))
-    record_rider_completion(rider_id)
+    record_rider_completion(rider_id, order.get("total", 0))
 
 
 async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,6 +695,26 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     await update.message.reply_text(f"📤 Broadcast sent to {sent} customers. ({failed} unreachable)")
+
+
+async def myearnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    stats = get_rider_stats(user.id)
+    if stats is None:
+        await update.message.reply_text("No delivery history found yet — claim your first order to get started! 🚴")
+        return
+
+    completed = stats.get("Completed Deliveries", 0) or 0
+    earnings = stats.get("Total Earnings", 0) or 0
+    claimed = stats.get("Deliveries Claimed", 0) or 0
+
+    await update.message.reply_text(
+        f"💰 *Your BikeBlitz Earnings*\n\n"
+        f"📦 Deliveries claimed: {claimed}\n"
+        f"✅ Deliveries completed: {completed}\n"
+        f"💳 Total earned: ₦{int(earnings):,}",
+        parse_mode="Markdown"
+    )
 
 
 async def whosonline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1559,11 +1667,21 @@ def main():
     app.add_handler(CommandHandler("online", online))
     app.add_handler(CommandHandler("offline", offline))
     app.add_handler(CommandHandler("whosonline", whosonline))
+    app.add_handler(CommandHandler("myearnings", myearnings))
     app.add_handler(CommandHandler("broadcast", broadcast))
 
     # Global handler (separate group) — catches delivery proof photos from riders
     # regardless of what conversation state the customer-facing flow is in.
     app.add_handler(MessageHandler(filters.PHOTO, handle_delivery_proof_photo), group=1)
+
+    # Weekly recap — Sunday 9 PM WAT (20:00 UTC, since WAT is UTC+1)
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            send_weekly_summary,
+            time=dt_time(hour=20, minute=0),
+            days=(6,),
+            name="weekly_summary",
+        )
 
     # --- Webhook setup for Render ---
     # Render sets PORT automatically. RENDER_EXTERNAL_URL is your service's public URL,
