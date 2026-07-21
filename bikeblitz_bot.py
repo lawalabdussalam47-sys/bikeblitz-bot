@@ -199,6 +199,18 @@ def get_week_stats():
         return None
 
 
+async def send_cutoff_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job — reminds the rider group that the 8pm same-day cutoff is approaching."""
+    try:
+        await context.bot.send_message(
+            chat_id=RIDER_GROUP_CHAT_ID,
+            text="⏰ *Heads up!* Same-day order cutoff is in 30 minutes (8:00 PM). Wrap up active deliveries soon! 🚴",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to send cutoff reminder")
+
+
 async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
     """Scheduled job — posts a weekly recap to the admin every Sunday night."""
     data = get_week_stats()
@@ -294,7 +306,8 @@ logger = logging.getLogger(__name__)
     AWAITING_PAYMENT_PROOF,
     CHOOSING_LOCATION_DETAILS,
     AWAITING_SUPPORT_MESSAGE,
-) = range(10)
+    AWAITING_ERRAND_ITEMS,
+) = range(11)
 
 # Pricing
 ZONE_PRICES = {
@@ -693,6 +706,40 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+def record_rider_zone(rider_id, rider_name, zone_name):
+    """Set a rider's home zone in column H, creating the row/column if needed."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        if rows and len(rows[0]) < 8:
+            ws.update("H1", [["Home Zone"]])
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                ws.update(f"H{idx}", [[zone_name]])
+                return
+        ws.append_row([rider_name, str(rider_id), 0, "", 0, "", 0, zone_name])
+    except Exception:
+        logger.exception("Failed to update rider home zone")
+
+
+def get_riders_by_zone(zone_name):
+    """Return Telegram IDs of online riders whose home zone matches."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return []
+        records = ws.get_all_records()
+        return [
+            r.get("Telegram ID") for r in records
+            if r.get("Home Zone") == zone_name and r.get("Availability") == "Online"
+        ]
+    except Exception:
+        logger.exception("Failed to fetch riders by zone")
+        return []
+
+
 async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     record_rider_status(user.id, user.full_name, "Online")
@@ -749,6 +796,34 @@ async def myearnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Deliveries claimed: {claimed}\n"
         f"✅ Deliveries completed: {completed}\n"
         f"💳 Total earned: ₦{int(earnings):,}",
+        parse_mode="Markdown"
+    )
+
+
+async def setzone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    zone_map = {
+        "1": "Zone 1 - On Campus",
+        "2": "Zone 2 - Near Off Campus",
+        "3": "Zone 3 - Mid Off Campus",
+        "4": "Zone 4 - Far Off Campus",
+    }
+    if not context.args or context.args[0] not in zone_map:
+        await update.message.reply_text(
+            "Set your home zone so you get a heads-up when matching orders come in:\n\n"
+            "`/setzone 1` — On Campus\n"
+            "`/setzone 2` — Near Off Campus\n"
+            "`/setzone 3` — Mid Off Campus\n"
+            "`/setzone 4` — Far Off Campus",
+            parse_mode="Markdown"
+        )
+        return
+
+    zone_name = zone_map[context.args[0]]
+    user = update.effective_user
+    record_rider_zone(user.id, user.full_name, zone_name)
+    await update.message.reply_text(
+        f"✅ Your home zone is set to *{zone_name}*.\n\n"
+        "You'll get a heads-up ping when matching orders come in (as long as you're /online)!",
         parse_mode="Markdown"
     )
 
@@ -1097,6 +1172,23 @@ async def handle_errand(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ Errand type: *{text}*\n\n"
+        "What exactly do you need us to get or do? Be specific (items, quantities, restaurant/shop name, etc.)\n\n"
+        "_Example: 2 loaves of bread and a carton of eggs from Mama Nkechi's shop near Zoo gate_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+    )
+    return AWAITING_ERRAND_ITEMS
+
+
+async def handle_errand_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    context.user_data["errand_items"] = text.strip()
+
+    await update.message.reply_text(
+        f"📝 Got it: *{text.strip()}*\n\n"
         "Now select your delivery zone 👇",
         parse_mode="Markdown",
         reply_markup=zone_keyboard()
@@ -1216,6 +1308,7 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
     else:
         errand_fee = context.user_data.get("errand_fee", 100)
         errand_type = context.user_data.get("errand_type")
+        errand_items = context.user_data.get("errand_items", "N/A")
         base_price = ZONE_PRICES[zone]["Light"]
         distance_add = DISTANCE_MODIFIER if far_from_busstop else 0
         express_add = EXPRESS_SURCHARGE if delivery_type == "Express" else 0
@@ -1229,6 +1322,7 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         breakdown = (
             f"📋 *Order Summary*\n\n"
             f"🛒 Service: {errand_type}\n"
+            f"📝 Items: {errand_items}\n"
             f"🗺️ Zone: {zone}\n"
             f"📍 Location: {location_details}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
@@ -1341,6 +1435,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     total = context.user_data.get("total", 0)
     weight = context.user_data.get("weight")
     errand_type = context.user_data.get("errand_type")
+    errand_items = context.user_data.get("errand_items", "")
     scheduled_time = context.user_data.get("scheduled_time", "")
     location_details = context.user_data.get("location_details", "Not provided")
 
@@ -1349,6 +1444,10 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         f"👤 Customer: {user.full_name} (@{user.username or 'no username'})\n"
         f"🆔 Telegram ID: {user.id}\n"
         f"🛠️ Service: {service} {f'- {weight}' if weight else ''}{f'- {errand_type}' if errand_type else ''}\n"
+    )
+    if errand_items:
+        summary += f"📝 Items: {errand_items}\n"
+    summary += (
         f"🗺️ Zone: {zone}\n"
         f"📍 Exact location: {location_details}\n"
         f"🚴 Delivery Type: {delivery_type}\n"
@@ -1372,6 +1471,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         "service": service,
         "zone": zone,
         "location": location_details,
+        "errand_items": context.user_data.get("errand_items", ""),
     }
 
     approval_keyboard = InlineKeyboardMarkup([
@@ -1417,6 +1517,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         service = order.get("service", "N/A") if order else "N/A"
         zone = order.get("zone", "N/A") if order else "N/A"
         location = order.get("location", "N/A") if order else "N/A"
+        errand_items = order.get("errand_items", "") if order else ""
 
         msg = (
             "✅ *Payment Confirmed!*\n\n"
@@ -1455,6 +1556,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             "service": service,
             "zone": zone,
             "location": location,
+            "errand_items": errand_items,
             "delivery_type": delivery_type,
             "scheduled_time": scheduled_time,
             "total": total,
@@ -1467,6 +1569,10 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         order_text = (
             "🚴 *New Order Available!*\n\n"
             f"🛠️ Service: {service}\n"
+        )
+        if errand_items:
+            order_text += f"📝 Items: {errand_items}\n"
+        order_text += (
             f"🗺️ Zone: {zone}\n"
             f"📍 Location: {location}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
@@ -1497,6 +1603,16 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                     data=customer_id_str,
                     name=f"unclaimed_{customer_id_str}",
                 )
+
+            # Zone-targeted heads-up — nudge online riders whose home zone matches
+            for rider_tid in get_riders_by_zone(zone):
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(rider_tid),
+                        text=f"🎯 New order in your zone ({zone})! Check the rider group to claim it.",
+                    )
+                except Exception:
+                    logger.exception(f"Could not send zone heads-up to rider {rider_tid}")
         except Exception:
             logger.exception("Failed to broadcast order to rider group")
     else:
@@ -1599,6 +1715,10 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
     detail_text = (
         "📦 *Delivery Details*\n\n"
         f"🛠️ Service: {order.get('service')}\n"
+    )
+    if order.get("errand_items"):
+        detail_text += f"📝 Items: {order.get('errand_items')}\n"
+    detail_text += (
         f"🗺️ Zone: {order.get('zone')}\n"
         f"📍 Location: {order.get('location')}\n"
         f"🚴 Delivery Type: {order.get('delivery_type')}\n"
@@ -1743,6 +1863,7 @@ def main():
             CHOOSING_BUSSTOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_busstop)],
             CHOOSING_LOCATION_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_details)],
             AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message)],
+            AWAITING_ERRAND_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand_items)],
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
             SCHEDULING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_time)],
@@ -1773,6 +1894,7 @@ def main():
     app.add_handler(CommandHandler("online", online))
     app.add_handler(CommandHandler("offline", offline))
     app.add_handler(CommandHandler("whosonline", whosonline))
+    app.add_handler(CommandHandler("setzone", setzone))
     app.add_handler(CommandHandler("myearnings", myearnings))
     app.add_handler(CommandHandler("broadcast", broadcast))
 
@@ -1787,6 +1909,12 @@ def main():
             time=dt_time(hour=20, minute=0),
             days=(6,),
             name="weekly_summary",
+        )
+        # Daily cutoff reminder — 7:30 PM WAT (18:30 UTC), 30 min before the 8 PM cutoff
+        app.job_queue.run_daily(
+            send_cutoff_reminder,
+            time=dt_time(hour=18, minute=30),
+            name="cutoff_reminder",
         )
 
     # --- Webhook setup for Render ---
