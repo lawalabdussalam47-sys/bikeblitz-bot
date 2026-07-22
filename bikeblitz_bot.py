@@ -307,7 +307,8 @@ logger = logging.getLogger(__name__)
     CHOOSING_LOCATION_DETAILS,
     AWAITING_SUPPORT_MESSAGE,
     AWAITING_ERRAND_ITEMS,
-) = range(11)
+    AWAITING_PROMO_CODE,
+) = range(12)
 
 # Pricing
 ZONE_PRICES = {
@@ -325,12 +326,237 @@ ERRAND_FEES = {
 EXPRESS_SURCHARGE = 300
 DISTANCE_MODIFIER = 200
 
+# --- Referral program ---
+REFERRAL_BONUS_REFERRER = 200
+REFERRAL_BONUS_REFERRED = 100
+
 ZONE_LOCATIONS = {
     "Zone 1 - On Campus": "Anywhere within FUNAAB campus",
     "Zone 2 - Near Off Campus": "Harmony, Accord, Zoo, Agbede, Kofesu",
     "Zone 3 - Mid Off Campus": "Labuta, Isolu-Cele, Isolu-FUNIS, Camp",
     "Zone 4 - Far Off Campus": "Town",
 }
+
+
+# ---------- Referral program helpers ----------
+
+def get_referrals_sheet():
+    """Returns the 'Referrals' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Referrals")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Referrals", rows=500, cols=6)
+            ws.append_row(["Telegram ID", "Name", "Referral Code", "Referred By Code", "Credit Balance", "Total Referred"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Referrals worksheet")
+        return None
+
+
+def generate_referral_code(user_id):
+    return f"BB{user_id % 100000:05d}"
+
+
+def get_or_create_referral_row(user_id, user_name):
+    """Ensure a customer has a row in Referrals; return (row_index, row_values_list)."""
+    try:
+        ws = get_referrals_sheet()
+        if ws is None:
+            return None, None
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                return idx, row
+        code = generate_referral_code(user_id)
+        ws.append_row([str(user_id), user_name, code, "", 0, 0])
+        return len(rows) + 1, [str(user_id), user_name, code, "", "0", "0"]
+    except Exception:
+        logger.exception("Failed to get/create referral row")
+        return None, None
+
+
+def get_referral_code_owner(code):
+    """Find the Referrals row matching a given referral code."""
+    try:
+        ws = get_referrals_sheet()
+        if ws is None:
+            return None
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Referral Code", "")).upper() == code.upper():
+                return r
+        return None
+    except Exception:
+        logger.exception("Failed to look up referral code owner")
+        return None
+
+
+def redeem_referral_code(user_id, user_name, code):
+    """Apply a referral code redemption: credit both parties. Returns (success, message)."""
+    try:
+        ws = get_referrals_sheet()
+        if ws is None:
+            return False, "Referral system isn't set up yet."
+
+        owner = get_referral_code_owner(code)
+        if owner is None:
+            return False, "❌ That referral code doesn't exist."
+        if str(owner.get("Telegram ID")) == str(user_id):
+            return False, "❌ You can't use your own referral code."
+
+        row_idx, row = get_or_create_referral_row(user_id, user_name)
+        if row_idx is None:
+            return False, "Referral system isn't set up yet."
+        if row[3]:
+            return False, "❌ You've already used a referral code."
+
+        rows = ws.get_all_values()
+        for idx, r in enumerate(rows[1:], start=2):
+            if len(r) > 0 and r[0] == str(user_id):
+                current_credit = int(r[4]) if len(r) > 4 and str(r[4]).isdigit() else 0
+                ws.update(f"D{idx}:E{idx}", [[code.upper(), current_credit + REFERRAL_BONUS_REFERRED]])
+                break
+        for idx, r in enumerate(rows[1:], start=2):
+            if len(r) > 0 and r[0] == str(owner.get("Telegram ID")):
+                current_credit = int(r[4]) if len(r) > 4 and str(r[4]).isdigit() else 0
+                current_referred = int(r[5]) if len(r) > 5 and str(r[5]).isdigit() else 0
+                ws.update(f"E{idx}:F{idx}", [[current_credit + REFERRAL_BONUS_REFERRER, current_referred + 1]])
+                break
+
+        return True, (
+            f"✅ Referral applied! You've earned ₦{REFERRAL_BONUS_REFERRED} credit toward your next order.\n\n"
+            "_Credit is applied automatically at checkout._"
+        )
+    except Exception:
+        logger.exception("Failed to redeem referral code")
+        return False, "Something went wrong redeeming that code — try again shortly."
+
+
+def get_credit_balance(user_id):
+    try:
+        ws = get_referrals_sheet()
+        if ws is None:
+            return 0
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(user_id):
+                return int(r.get("Credit Balance", 0) or 0)
+        return 0
+    except Exception:
+        logger.exception("Failed to fetch credit balance")
+        return 0
+
+
+def deduct_credit(user_id, amount):
+    if not amount:
+        return
+    try:
+        ws = get_referrals_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                current = int(row[4]) if len(row) > 4 and str(row[4]).isdigit() else 0
+                ws.update(f"E{idx}", [[max(0, current - amount)]])
+                return
+    except Exception:
+        logger.exception("Failed to deduct credit")
+
+
+# ---------- Promo code helpers ----------
+
+def get_promo_sheet():
+    """Returns the 'PromoCodes' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("PromoCodes")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="PromoCodes", rows=200, cols=7)
+            ws.append_row(["Code", "Type", "Value", "Max Uses", "Times Used", "Active", "Expiry"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access PromoCodes worksheet")
+        return None
+
+
+def create_promo_code(code, promo_type, value, max_uses, expiry):
+    try:
+        ws = get_promo_sheet()
+        if ws is None:
+            return False, "Google Sheets isn't configured yet."
+        rows = ws.get_all_values()
+        for row in rows[1:]:
+            if len(row) > 0 and row[0].upper() == code.upper():
+                return False, "That code already exists."
+        ws.append_row([code.upper(), promo_type, value, max_uses, 0, "Yes", expiry or ""])
+        return True, f"Promo code *{code.upper()}* created."
+    except Exception:
+        logger.exception("Failed to create promo code")
+        return False, "Something went wrong creating that code."
+
+
+def get_promo_code(code):
+    try:
+        ws = get_promo_sheet()
+        if ws is None:
+            return None
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Code", "")).upper() == code.upper():
+                return r
+        return None
+    except Exception:
+        logger.exception("Failed to fetch promo code")
+        return None
+
+
+def validate_promo_code(code):
+    """Returns (valid, discount_type, discount_value, message)."""
+    promo = get_promo_code(code)
+    if promo is None:
+        return False, None, None, "❌ That promo code doesn't exist."
+    if str(promo.get("Active", "Yes")).strip().lower() != "yes":
+        return False, None, None, "❌ That promo code is no longer active."
+    expiry = promo.get("Expiry", "")
+    if expiry:
+        try:
+            expiry_date = datetime.strptime(str(expiry), "%Y-%m-%d")
+            if datetime.now() > expiry_date:
+                return False, None, None, "❌ That promo code has expired."
+        except ValueError:
+            pass
+    max_uses = int(promo.get("Max Uses", 0) or 0)
+    times_used = int(promo.get("Times Used", 0) or 0)
+    if max_uses and times_used >= max_uses:
+        return False, None, None, "❌ That promo code has reached its usage limit."
+    promo_type = str(promo.get("Type", "percent")).strip().lower()
+    value = int(promo.get("Value", 0) or 0)
+    return True, promo_type, value, "Valid"
+
+
+def increment_promo_usage(code):
+    try:
+        ws = get_promo_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0].upper() == code.upper():
+                current = int(row[4]) if len(row) > 4 and row[4].isdigit() else 0
+                ws.update(f"E{idx}", [[current + 1]])
+                return
+    except Exception:
+        logger.exception("Failed to increment promo usage")
 
 
 # ---------- Keyboards ----------
@@ -399,6 +625,7 @@ def delivery_type_keyboard():
 def confirm_keyboard():
     keyboard = [
         [KeyboardButton("✅ Confirm Order")],
+        [KeyboardButton("🎟️ Apply Promo Code")],
         [KeyboardButton("❌ Cancel Order")],
         [KeyboardButton("🏠 Main Menu")],
     ]
@@ -835,6 +1062,74 @@ async def whosonline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["🟢 *Riders Online Now:*\n"] + [f"• {name}" for name in online_riders]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- Referral & promo commands ----------
+
+async def myreferral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row_idx, row = get_or_create_referral_row(user.id, user.full_name)
+    if row_idx is None:
+        await update.message.reply_text("Referral system isn't set up yet — check back soon!")
+        return
+    code = row[2]
+    credit = int(row[4]) if len(row) > 4 and str(row[4]).isdigit() else 0
+    await update.message.reply_text(
+        f"🎁 *Your Referral Code:* `{code}`\n\n"
+        "Share it with friends! When they run:\n"
+        f"`/referral {code}`\n\n"
+        f"• They get ₦{REFERRAL_BONUS_REFERRED} credit\n"
+        f"• You get ₦{REFERRAL_BONUS_REFERRER} credit\n\n"
+        f"💰 Your current credit balance: ₦{credit:,}\n"
+        "_Credit is applied automatically at your next checkout._",
+        parse_mode="Markdown",
+    )
+
+
+async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/referral CODE` — enter a friend's referral code to get credit.",
+            parse_mode="Markdown"
+        )
+        return
+    code = context.args[0].upper()
+    success, msg = redeem_referral_code(user.id, user.full_name, code)
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def createpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if len(context.args) < 4:
+        await update.message.reply_text(
+            "Usage: `/createpromo CODE TYPE VALUE MAXUSES [EXPIRY]`\n\n"
+            "TYPE: `percent` or `fixed`\n"
+            "VALUE: number (e.g. 10 for 10% or ₦10)\n"
+            "MAXUSES: 0 for unlimited\n"
+            "EXPIRY: optional, format YYYY-MM-DD\n\n"
+            "Example:\n`/createpromo WELCOME10 percent 10 100 2026-12-31`",
+            parse_mode="Markdown"
+        )
+        return
+
+    code, promo_type, value_str, max_uses_str = context.args[0], context.args[1].lower(), context.args[2], context.args[3]
+    expiry = context.args[4] if len(context.args) > 4 else ""
+
+    if promo_type not in ("percent", "fixed"):
+        await update.message.reply_text("TYPE must be `percent` or `fixed`.", parse_mode="Markdown")
+        return
+    try:
+        value = int(value_str)
+        max_uses = int(max_uses_str)
+    except ValueError:
+        await update.message.reply_text("VALUE and MAXUSES must be numbers.")
+        return
+
+    success, msg = create_promo_code(code, promo_type, value, max_uses, expiry)
+    await update.message.reply_text(("✅ " if success else "❌ ") + msg, parse_mode="Markdown")
 
 
 async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1278,11 +1573,6 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         express_add = EXPRESS_SURCHARGE if delivery_type == "Express" else 0
         total = base_price + distance_add + express_add
 
-        context.user_data["total"] = total
-        context.user_data["base_price"] = base_price
-        context.user_data["distance_add"] = distance_add
-        context.user_data["express_add"] = express_add
-
         breakdown = (
             f"📋 *Order Summary*\n\n"
             f"📦 Service: Package Delivery\n"
@@ -1298,13 +1588,6 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
             breakdown += f"📍 Distance modifier: +₦{distance_add:,}\n"
         if express_add:
             breakdown += f"⚡ Express surcharge: +₦{express_add:,}\n"
-        breakdown += (
-            f"━━━━━━━━━━━━━━━━\n"
-            f"💳 *Total Delivery Charge: ₦{total:,}*\n\n"
-            f"Rider earns: ₦{int(total * 0.7):,} (70%)\n"
-            f"BikeBlitz: ₦{int(total * 0.3):,} (30%)\n\n"
-            f"Would you like to confirm this order? 👇"
-        )
     else:
         errand_fee = context.user_data.get("errand_fee", 100)
         errand_type = context.user_data.get("errand_type")
@@ -1313,11 +1596,6 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         distance_add = DISTANCE_MODIFIER if far_from_busstop else 0
         express_add = EXPRESS_SURCHARGE if delivery_type == "Express" else 0
         total = base_price + errand_fee + distance_add + express_add
-
-        context.user_data["total"] = total
-        context.user_data["base_price"] = base_price
-        context.user_data["distance_add"] = distance_add
-        context.user_data["express_add"] = express_add
 
         breakdown = (
             f"📋 *Order Summary*\n\n"
@@ -1335,11 +1613,36 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
             breakdown += f"📍 Distance modifier: +₦{distance_add:,}\n"
         if express_add:
             breakdown += f"⚡ Express surcharge: +₦{express_add:,}\n"
+
+    context.user_data["base_price"] = base_price
+    context.user_data["distance_add"] = distance_add
+    context.user_data["express_add"] = express_add
+
+    # Auto-apply any referral credit the customer has earned
+    user_id = update.effective_user.id
+    credit = get_credit_balance(user_id)
+    credit_applied = min(credit, total) if credit else 0
+    context.user_data["credit_applied"] = credit_applied
+    if credit_applied:
+        total -= credit_applied
+        breakdown += f"🎁 Referral credit applied: -₦{credit_applied:,}\n"
+
+    context.user_data["total"] = total
+
+    if service == "B2B":
+        breakdown += (
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💳 *Total Delivery Charge: ₦{total:,}*\n\n"
+            f"Rider earns: ₦{int(total * 0.7):,} (70%)\n"
+            f"BikeBlitz: ₦{int(total * 0.3):,} (30%)\n\n"
+            f"Have a promo code? Tap 🎟️ below, or confirm to proceed 👇"
+        )
+    else:
         breakdown += (
             f"━━━━━━━━━━━━━━━━\n"
             f"💳 *Total Delivery Charge: ₦{total:,}*\n\n"
             f"_Item cost paid directly to vendor_\n\n"
-            f"Would you like to confirm this order? 👇"
+            f"Have a promo code? Tap 🎟️ below, or confirm to proceed 👇"
         )
 
     if delivery_type == "Scheduled":
@@ -1347,6 +1650,41 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         breakdown += f"\n📅 Scheduled for: *{scheduled_time}*"
 
     await update.message.reply_text(breakdown, parse_mode="Markdown", reply_markup=confirm_keyboard())
+    return CONFIRMING_ORDER
+
+
+async def handle_promo_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    code = text.strip().upper()
+    valid, promo_type, value, msg = validate_promo_code(code)
+    if not valid:
+        await update.message.reply_text(
+            f"{msg}\n\nTry a different code, or tap ✅ Confirm Order to proceed without one.",
+            reply_markup=confirm_keyboard()
+        )
+        return CONFIRMING_ORDER
+
+    subtotal = context.user_data.get("total", 0)
+    if promo_type == "percent":
+        discount = int(subtotal * value / 100)
+    else:
+        discount = min(value, subtotal)
+
+    context.user_data["promo_code"] = code
+    context.user_data["promo_discount"] = discount
+    new_total = max(0, subtotal - discount)
+    context.user_data["total"] = new_total
+
+    await update.message.reply_text(
+        f"✅ Promo code *{code}* applied! -₦{discount:,}\n\n"
+        f"💳 *New Total: ₦{new_total:,}*\n\n"
+        "Ready to confirm? 👇",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard()
+    )
     return CONFIRMING_ORDER
 
 
@@ -1359,6 +1697,13 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data.clear()
         return CHOOSING_SERVICE
+
+    if text == "🎟️ Apply Promo Code":
+        await update.message.reply_text(
+            "🎟️ Enter your promo code:",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+        )
+        return AWAITING_PROMO_CODE
 
     if text == "✅ Confirm Order":
         total = context.user_data.get("total", 0)
@@ -1384,10 +1729,24 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return CONFIRMING_ORDER
         recent[user_id] = (datetime.now(), zone, service, total)
 
+        # Settle referral credit and promo code usage now that the order is truly confirmed
+        credit_applied = context.user_data.get("credit_applied", 0)
+        if credit_applied:
+            deduct_credit(user_id, credit_applied)
+        promo_code = context.user_data.get("promo_code")
+        if promo_code:
+            increment_promo_usage(promo_code)
+
         confirmation = (
             f"✅ *Order Confirmed!*\n\n"
             f"💳 *Total Delivery Charge: ₦{total:,}*\n\n"
-            f"Please transfer ₦{total:,} to:\n"
+        )
+        if credit_applied:
+            confirmation += f"🎁 Referral credit applied: -₦{credit_applied:,}\n"
+        if context.user_data.get("promo_discount"):
+            confirmation += f"🎟️ Promo code {promo_code} applied: -₦{context.user_data.get('promo_discount'):,}\n"
+        confirmation += (
+            f"\nPlease transfer ₦{total:,} to:\n"
             f"🏦 Bank: Moniepoint\n"
             f"🔢 Account: 8144124522\n"
             f"👤 Name: Lawal Abdussalam\n\n"
@@ -1438,6 +1797,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     errand_items = context.user_data.get("errand_items", "")
     scheduled_time = context.user_data.get("scheduled_time", "")
     location_details = context.user_data.get("location_details", "Not provided")
+    promo_code = context.user_data.get("promo_code")
+    credit_applied = context.user_data.get("credit_applied", 0)
 
     summary = (
         f"💰 *New Payment Received*\n\n"
@@ -1454,6 +1815,10 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     if scheduled_time:
         summary += f"📅 Scheduled: {scheduled_time}\n"
+    if credit_applied:
+        summary += f"🎁 Referral credit used: ₦{credit_applied:,}\n"
+    if promo_code:
+        summary += f"🎟️ Promo code used: {promo_code} (-₦{context.user_data.get('promo_discount', 0):,})\n"
     summary += f"💳 Total: ₦{total:,}"
 
     # Forward the screenshot + summary to the admin, with Approve/Reject buttons
@@ -1866,6 +2231,7 @@ def main():
             AWAITING_ERRAND_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand_items)],
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
+            AWAITING_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_promo_code)],
             SCHEDULING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_time)],
             AWAITING_PAYMENT_PROOF: [
                 MessageHandler(filters.PHOTO, handle_payment_proof),
@@ -1897,6 +2263,9 @@ def main():
     app.add_handler(CommandHandler("setzone", setzone))
     app.add_handler(CommandHandler("myearnings", myearnings))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("myreferral", myreferral))
+    app.add_handler(CommandHandler("referral", referral))
+    app.add_handler(CommandHandler("createpromo", createpromo))
 
     # Global handler (separate group) — catches delivery proof photos from riders
     # regardless of what conversation state the customer-facing flow is in.
