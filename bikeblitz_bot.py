@@ -329,6 +329,7 @@ DISTANCE_MODIFIER = 200
 # --- Referral program ---
 REFERRAL_BONUS_REFERRER = 200
 REFERRAL_BONUS_REFERRED = 100
+REFERRAL_CREDIT_MAX_PERCENT = 50  # credit can cover at most this % of a single order's total
 
 ZONE_LOCATIONS = {
     "Zone 1 - On Campus": "Anywhere within FUNAAB campus",
@@ -1081,7 +1082,7 @@ async def myreferral(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• They get ₦{REFERRAL_BONUS_REFERRED} credit\n"
         f"• You get ₦{REFERRAL_BONUS_REFERRER} credit\n\n"
         f"💰 Your current credit balance: ₦{credit:,}\n"
-        "_Credit is applied automatically at your next checkout._",
+        f"_Credit is applied automatically at checkout, up to {REFERRAL_CREDIT_MAX_PERCENT}% of each order's total._",
         parse_mode="Markdown",
     )
 
@@ -1618,14 +1619,18 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["distance_add"] = distance_add
     context.user_data["express_add"] = express_add
 
-    # Auto-apply any referral credit the customer has earned
+    # Auto-apply any referral credit the customer has earned, capped per order
     user_id = update.effective_user.id
     credit = get_credit_balance(user_id)
-    credit_applied = min(credit, total) if credit else 0
+    credit_cap = int(total * REFERRAL_CREDIT_MAX_PERCENT / 100)
+    credit_applied = min(credit, credit_cap) if credit else 0
     context.user_data["credit_applied"] = credit_applied
     if credit_applied:
         total -= credit_applied
-        breakdown += f"🎁 Referral credit applied: -₦{credit_applied:,}\n"
+        remaining_credit = credit - credit_applied
+        breakdown += f"🎁 Referral credit applied: -₦{credit_applied:,} (max {REFERRAL_CREDIT_MAX_PERCENT}% per order)\n"
+        if remaining_credit:
+            breakdown += f"_₦{remaining_credit:,} credit remains for a future order_\n"
 
     context.user_data["total"] = total
 
