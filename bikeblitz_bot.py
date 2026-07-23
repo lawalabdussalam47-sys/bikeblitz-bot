@@ -310,6 +310,15 @@ logger = logging.getLogger(__name__)
     AWAITING_PROMO_CODE,
 ) = range(12)
 
+(
+    APPLY_NAME,
+    APPLY_PHONE,
+    APPLY_ZONE,
+    APPLY_BIKE,
+    APPLY_AVAILABILITY,
+    APPLY_JUDGMENT,
+) = range(12, 18)
+
 # Pricing
 ZONE_PRICES = {
     "Zone 1 - On Campus": {"Light": 300, "Medium": 500, "Heavy": 700},
@@ -560,6 +569,55 @@ def increment_promo_usage(code):
         logger.exception("Failed to increment promo usage")
 
 
+# ---------- Rider application helpers ----------
+
+def get_applications_sheet():
+    """Returns the 'Applications' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Applications")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Applications", rows=300, cols=9)
+            ws.append_row([
+                "Timestamp", "Telegram ID", "Name", "Phone", "Zone",
+                "Bike", "Availability", "Judgment Answer", "Status"
+            ])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Applications worksheet")
+        return None
+
+
+def save_application(user_id, name, phone, zone, bike, availability, judgment_answer):
+    """Append a new rider application row. Returns the sheet row number, or None on failure."""
+    try:
+        ws = get_applications_sheet()
+        if ws is None:
+            return None
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([timestamp, str(user_id), name, phone, zone, bike, availability, judgment_answer, "Pending"])
+        return len(ws.get_all_values())
+    except Exception:
+        logger.exception("Failed to save rider application")
+        return None
+
+
+def update_application_status(row, status):
+    if not row:
+        return
+    try:
+        ws = get_applications_sheet()
+        if ws is None:
+            return
+        ws.update(f"I{row}", [[status]])
+    except Exception:
+        logger.exception("Failed to update application status")
+
+
 # ---------- Keyboards ----------
 
 def main_menu():
@@ -629,6 +687,17 @@ def confirm_keyboard():
         [KeyboardButton("🎟️ Apply Promo Code")],
         [KeyboardButton("❌ Cancel Order")],
         [KeyboardButton("🏠 Main Menu")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def apply_zone_keyboard():
+    keyboard = [
+        [KeyboardButton("Zone 1 - On Campus")],
+        [KeyboardButton("Zone 2 - Near Off Campus")],
+        [KeyboardButton("Zone 3 - Mid Off Campus")],
+        [KeyboardButton("Zone 4 - Far Off Campus")],
+        [KeyboardButton("❌ Cancel")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1131,6 +1200,212 @@ async def createpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, msg = create_promo_code(code, promo_type, value, max_uses, expiry)
     await update.message.reply_text(("✅ " if success else "❌ ") + msg, parse_mode="Markdown")
+
+
+# ---------- Rider application flow ----------
+
+async def apply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🚴 *Ride for BikeBlitz*\n\n"
+        "Thanks for your interest! This takes about 2 minutes — we'll follow up with a quick call after.\n\n"
+        "What's your full name?",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return APPLY_NAME
+
+
+async def apply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Application cancelled. Run /apply anytime to start again.",
+        reply_markup=main_menu()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def apply_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    context.user_data["apply_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📱 What's your phone number (WhatsApp preferred)?",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return APPLY_PHONE
+
+
+async def apply_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    context.user_data["apply_phone"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🗺️ Which zone do you live in / can mainly ride for?",
+        reply_markup=apply_zone_keyboard()
+    )
+    return APPLY_ZONE
+
+
+async def apply_zone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    if text not in ZONE_PRICES:
+        await update.message.reply_text("Please select a valid zone 👇", reply_markup=apply_zone_keyboard())
+        return APPLY_ZONE
+    context.user_data["apply_zone"] = text
+    await update.message.reply_text(
+        "🚲 Tell us about your bike — type and condition.\n\n"
+        "_Example: Pedal bike, good condition, new tires_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return APPLY_BIKE
+
+
+async def apply_bike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    context.user_data["apply_bike"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🕒 What days/hours can you ride?\n\n"
+        "_Example: Weekdays 4pm-9pm, weekends flexible_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return APPLY_AVAILABILITY
+
+
+async def apply_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    context.user_data["apply_availability"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🧠 Last one — a quick judgment question:\n\n"
+        "_You arrive to pick up an errand item, and it costs ₦500 more than the customer told you. "
+        "What do you do?_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return APPLY_JUDGMENT
+
+
+async def apply_judgment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await apply_cancel(update, context)
+    context.user_data["apply_judgment"] = update.message.text.strip()
+
+    user = update.effective_user
+    name = context.user_data.get("apply_name", user.full_name)
+    phone = context.user_data.get("apply_phone", "N/A")
+    zone = context.user_data.get("apply_zone", "N/A")
+    bike = context.user_data.get("apply_bike", "N/A")
+    availability = context.user_data.get("apply_availability", "N/A")
+    judgment = context.user_data.get("apply_judgment", "")
+
+    row = save_application(user.id, name, phone, zone, bike, availability, judgment)
+
+    pending = context.application.bot_data.setdefault("pending_applications", {})
+    pending[str(user.id)] = {
+        "name": name,
+        "phone": phone,
+        "zone": zone,
+        "bike": bike,
+        "availability": availability,
+        "judgment": judgment,
+        "row": row,
+    }
+
+    summary = (
+        "🚴 *New Rider Application*\n\n"
+        f"👤 Name: {name}\n"
+        f"🆔 Telegram: @{user.username or 'no username'} (ID {user.id})\n"
+        f"📱 Phone: {phone}\n"
+        f"🗺️ Zone: {zone}\n"
+        f"🚲 Bike: {bike}\n"
+        f"🕒 Availability: {availability}\n\n"
+        f"🧠 Judgment answer:\n_{judgment}_"
+    )
+    decision_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"riderapprove:{user.id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"riderreject:{user.id}"),
+        ]
+    ])
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=summary,
+        parse_mode="Markdown",
+        reply_markup=decision_keyboard,
+    )
+
+    await update.message.reply_text(
+        "✅ Application received! We'll follow up with a quick call, then let you know here.\n\n"
+        "Thanks for wanting to ride with BikeBlitz! 🚴",
+        reply_markup=main_menu()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_rider_application_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, applicant_id_str = query.data.split(":", 1)
+    applicant_id = int(applicant_id_str)
+
+    pending = context.application.bot_data.get("pending_applications", {})
+    app_info = pending.pop(applicant_id_str, None)
+
+    if action == "riderapprove":
+        name = app_info.get("name", "Unknown") if app_info else "Unknown"
+        zone = app_info.get("zone") if app_info else None
+        row = app_info.get("row") if app_info else None
+
+        update_application_status(row, "Approved")
+        if zone:
+            record_rider_zone(applicant_id, name, zone)
+
+        await query.edit_message_text(
+            (query.message.text or "") + "\n\n✅ *APPROVED*",
+            parse_mode="Markdown",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=applicant_id,
+                text=(
+                    "🎉 *You're in!* Welcome to the BikeBlitz rider team.\n\n"
+                    "Quick commands to know:\n"
+                    "`/online` — mark yourself available for orders\n"
+                    "`/offline` — step away\n"
+                    "`/setzone` — set/update your home zone\n"
+                    "`/myearnings` — check your earnings\n"
+                    "`/leaderboard` — see top riders\n\n"
+                    "Run `/online` whenever you're ready to start riding! 🚴"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Could not notify approved applicant")
+    else:
+        row = app_info.get("row") if app_info else None
+        update_application_status(row, "Rejected")
+        await query.edit_message_text(
+            (query.message.text or "") + "\n\n❌ *REJECTED*",
+            parse_mode="Markdown",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=applicant_id,
+                text=(
+                    "Thanks for your interest in BikeBlitz. We're not able to bring you on right now, "
+                    "but we'll keep your info on file for future openings."
+                ),
+            )
+        except Exception:
+            logger.exception("Could not notify rejected applicant")
 
 
 async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2246,7 +2521,24 @@ def main():
         fallbacks=[CommandHandler("start", start)],
     )
 
+    apply_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("apply", apply_start)],
+        states={
+            APPLY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_name)],
+            APPLY_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_phone)],
+            APPLY_ZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_zone)],
+            APPLY_BIKE: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_bike)],
+            APPLY_AVAILABILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_availability)],
+            APPLY_JUDGMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_judgment)],
+        },
+        fallbacks=[CommandHandler("apply", apply_start)],
+    )
+
+    # Registered before the main conv_handler so an in-progress application
+    # takes priority over the customer-ordering flow for the same chat.
+    app.add_handler(apply_conv_handler)
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(handle_rider_application_decision, pattern=r"^(riderapprove|riderreject):"))
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
     app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
