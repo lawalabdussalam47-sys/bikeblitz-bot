@@ -1483,6 +1483,27 @@ async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to update rider group broadcast after cancellation")
 
 
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # silently ignore — this is admin-only
+
+    await update.message.reply_text(
+        "🛠️ *Admin Commands*\n\n"
+        "*Orders & Money*\n"
+        "`/stats` — today's & all-time orders/revenue\n"
+        "`/broadcast msg` — message every past customer\n"
+        "`/createpromo CODE TYPE VALUE MAXUSES [EXPIRY]` — create a promo code\n\n"
+        "*Riders*\n"
+        "`/whosonline` — riders currently online\n"
+        "`/leaderboard` — top riders by deliveries\n"
+        "New `/apply` submissions arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
+        "*Setup*\n"
+        "`/groupid` — get the chat ID of any chat (e.g. the rider group)\n\n"
+        "_This menu only responds to the admin account._",
+        parse_mode="Markdown",
+    )
+
+
 async def groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(
@@ -2669,6 +2690,7 @@ def main():
     app.add_handler(CommandHandler("myreferral", myreferral))
     app.add_handler(CommandHandler("referral", referral))
     app.add_handler(CommandHandler("createpromo", createpromo))
+    app.add_handler(CommandHandler("admin", admin_help))
 
     # Global handler (separate group) — catches delivery proof photos from riders
     # regardless of what conversation state the customer-facing flow is in.
