@@ -319,6 +319,8 @@ logger = logging.getLogger(__name__)
     APPLY_JUDGMENT,
 ) = range(12, 18)
 
+(AWAITING_TOPUP_PROOF,) = range(18, 19)
+
 # Pricing
 ZONE_PRICES = {
     "Zone 1 - On Campus": {"Light": 300, "Medium": 500, "Heavy": 700},
@@ -618,6 +620,77 @@ def update_application_status(row, status):
         logger.exception("Failed to update application status")
 
 
+# ---------- Wallet helpers ----------
+
+def get_wallet_sheet():
+    """Returns the 'Wallets' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Wallets")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Wallets", rows=500, cols=3)
+            ws.append_row(["Telegram ID", "Name", "Balance"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Wallets worksheet")
+        return None
+
+
+def get_wallet_balance(user_id):
+    try:
+        ws = get_wallet_sheet()
+        if ws is None:
+            return 0
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(user_id):
+                return int(r.get("Balance", 0) or 0)
+        return 0
+    except Exception:
+        logger.exception("Failed to fetch wallet balance")
+        return 0
+
+
+def add_wallet_balance(user_id, name, amount):
+    try:
+        ws = get_wallet_sheet()
+        if ws is None:
+            return
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                current = int(row[2]) if len(row) > 2 and str(row[2]).isdigit() else 0
+                ws.update(f"C{idx}", [[current + amount]])
+                return
+        ws.append_row([str(user_id), name, amount])
+    except Exception:
+        logger.exception("Failed to add wallet balance")
+
+
+def deduct_wallet_balance(user_id, amount):
+    """Deducts from wallet only if sufficient balance exists. Returns True on success."""
+    try:
+        ws = get_wallet_sheet()
+        if ws is None:
+            return False
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                current = int(row[2]) if len(row) > 2 and str(row[2]).isdigit() else 0
+                if current < amount:
+                    return False
+                ws.update(f"C{idx}", [[current - amount]])
+                return True
+        return False
+    except Exception:
+        logger.exception("Failed to deduct wallet balance")
+        return False
+
+
 # ---------- Keyboards ----------
 
 def main_menu():
@@ -681,13 +754,15 @@ def delivery_type_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-def confirm_keyboard():
+def confirm_keyboard(wallet_available=False):
     keyboard = [
         [KeyboardButton("✅ Confirm Order")],
-        [KeyboardButton("🎟️ Apply Promo Code")],
-        [KeyboardButton("❌ Cancel Order")],
-        [KeyboardButton("🏠 Main Menu")],
     ]
+    if wallet_available:
+        keyboard.append([KeyboardButton("💰 Pay from Wallet")])
+    keyboard.append([KeyboardButton("🎟️ Apply Promo Code")])
+    keyboard.append([KeyboardButton("❌ Cancel Order")])
+    keyboard.append([KeyboardButton("🏠 Main Menu")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -1169,6 +1244,149 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    balance = get_wallet_balance(user.id)
+    await update.message.reply_text(
+        f"👛 *Your BikeBlitz Wallet*\n\n"
+        f"💰 Balance: ₦{balance:,}\n\n"
+        "Use `/topup AMOUNT` to add funds — once approved, checkout is instant with no screenshot needed.",
+        parse_mode="Markdown",
+    )
+
+
+async def topup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/topup AMOUNT` — e.g. `/topup 2000`",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Amount must be a number.")
+        return ConversationHandler.END
+    if amount <= 0:
+        await update.message.reply_text("Amount must be greater than 0.")
+        return ConversationHandler.END
+
+    context.user_data["topup_amount"] = amount
+    await update.message.reply_text(
+        f"👛 *Top Up ₦{amount:,}*\n\n"
+        f"Please transfer ₦{amount:,} to:\n"
+        f"🏦 Bank: Moniepoint\n"
+        f"🔢 Account: 8144124522\n"
+        f"👤 Name: Lawal Abdussalam\n\n"
+        "Then send your payment screenshot here.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+    )
+    return AWAITING_TOPUP_PROOF
+
+
+async def topup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Top-up cancelled.", reply_markup=main_menu())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_topup_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancel":
+        return await topup_cancel(update, context)
+
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Please send your payment receipt as a *photo/screenshot* 📸, or tap Cancel.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
+        )
+        return AWAITING_TOPUP_PROOF
+
+    user = update.effective_user
+    amount = context.user_data.get("topup_amount", 0)
+    photo_file_id = update.message.photo[-1].file_id
+
+    pending = context.application.bot_data.setdefault("pending_topups", {})
+    pending[str(user.id)] = {"amount": amount, "name": user.full_name}
+
+    approval_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"topupapprove:{user.id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"topupreject:{user.id}"),
+        ]
+    ])
+    await context.bot.send_photo(
+        chat_id=ADMIN_CHAT_ID,
+        photo=photo_file_id,
+        caption=(
+            f"👛 *Wallet Top-Up Request*\n\n"
+            f"👤 {user.full_name} (@{user.username or 'no username'})\n"
+            f"🆔 {user.id}\n"
+            f"💰 Amount: ₦{amount:,}"
+        ),
+        parse_mode="Markdown",
+        reply_markup=approval_keyboard,
+    )
+
+    await update.message.reply_text(
+        "📸 Screenshot received! We're verifying your top-up now — you'll get a confirmation shortly ⏳",
+        reply_markup=main_menu()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_topup_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, user_id_str = query.data.split(":", 1)
+    user_id = int(user_id_str)
+
+    pending = context.application.bot_data.get("pending_topups", {})
+    info = pending.pop(user_id_str, None)
+
+    if action == "topupapprove":
+        amount = info.get("amount", 0) if info else 0
+        name = info.get("name", "Unknown") if info else "Unknown"
+        add_wallet_balance(user_id, name, amount)
+        new_balance = get_wallet_balance(user_id)
+
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + "\n\n✅ *APPROVED*",
+            parse_mode="Markdown",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"✅ *Top-up confirmed!* ₦{amount:,} added to your wallet.\n\n"
+                    f"💰 New balance: ₦{new_balance:,}\n\n"
+                    "You can now pay for orders instantly from your wallet at checkout!"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Could not notify customer of topup approval")
+    else:
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + "\n\n❌ *REJECTED*",
+            parse_mode="Markdown",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⚠️ We couldn't verify your top-up screenshot.\n\n"
+                    "Please resend a clear screenshot, or contact us:\n"
+                    "📱 WhatsApp: 08144124522"
+                ),
+            )
+        except Exception:
+            logger.exception("Could not notify customer of topup rejection")
+
+
 async def createpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # admin-only, silently ignore otherwise
@@ -1497,6 +1715,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/whosonline` — riders currently online\n"
         "`/leaderboard` — top riders by deliveries\n"
         "New `/apply` submissions arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
+        "*Wallet*\n"
+        "Customer `/topup` requests arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
         "*Setup*\n"
         "`/groupid` — get the chat ID of any chat (e.g. the rider group)\n\n"
         "_This menu only responds to the admin account._",
@@ -1950,7 +2170,12 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         scheduled_time = context.user_data.get("scheduled_time", "")
         breakdown += f"\n📅 Scheduled for: *{scheduled_time}*"
 
-    await update.message.reply_text(breakdown, parse_mode="Markdown", reply_markup=confirm_keyboard())
+    wallet_balance = get_wallet_balance(update.effective_user.id)
+    wallet_available = wallet_balance >= total
+    if wallet_available:
+        breakdown += f"\n\n👛 Wallet balance: ₦{wallet_balance:,} — pay instantly, no screenshot needed!"
+
+    await update.message.reply_text(breakdown, parse_mode="Markdown", reply_markup=confirm_keyboard(wallet_available))
     return CONFIRMING_ORDER
 
 
@@ -1961,10 +2186,11 @@ async def handle_promo_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = text.strip().upper()
     valid, promo_type, value, msg = validate_promo_code(code)
+    wallet_available = get_wallet_balance(update.effective_user.id) >= context.user_data.get("total", 0)
     if not valid:
         await update.message.reply_text(
             f"{msg}\n\nTry a different code, or tap ✅ Confirm Order to proceed without one.",
-            reply_markup=confirm_keyboard()
+            reply_markup=confirm_keyboard(wallet_available)
         )
         return CONFIRMING_ORDER
 
@@ -1978,13 +2204,14 @@ async def handle_promo_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["promo_discount"] = discount
     new_total = max(0, subtotal - discount)
     context.user_data["total"] = new_total
+    wallet_available = get_wallet_balance(update.effective_user.id) >= new_total
 
     await update.message.reply_text(
         f"✅ Promo code *{code}* applied! -₦{discount:,}\n\n"
         f"💳 *New Total: ₦{new_total:,}*\n\n"
         "Ready to confirm? 👇",
         parse_mode="Markdown",
-        reply_markup=confirm_keyboard()
+        reply_markup=confirm_keyboard(wallet_available)
     )
     return CONFIRMING_ORDER
 
@@ -2006,6 +2233,63 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AWAITING_PROMO_CODE
 
+    if text == "💰 Pay from Wallet":
+        user_id = update.effective_user.id
+        total = context.user_data.get("total", 0)
+        wallet_balance = get_wallet_balance(user_id)
+
+        if wallet_balance < total:
+            wallet_available = wallet_balance >= total
+            await update.message.reply_text(
+                f"⚠️ Your wallet balance (₦{wallet_balance:,}) isn't enough to cover ₦{total:,}.\n\n"
+                "Top up with `/topup AMOUNT`, or pay by bank transfer instead 👇",
+                parse_mode="Markdown",
+                reply_markup=confirm_keyboard(wallet_available)
+            )
+            return CONFIRMING_ORDER
+
+        if not deduct_wallet_balance(user_id, total):
+            await update.message.reply_text(
+                "⚠️ Something went wrong deducting from your wallet. Please try bank transfer instead 👇",
+                reply_markup=confirm_keyboard(False)
+            )
+            return CONFIRMING_ORDER
+
+        # Settle referral credit and promo code usage
+        credit_applied = context.user_data.get("credit_applied", 0)
+        if credit_applied:
+            deduct_credit(user_id, credit_applied)
+        promo_code = context.user_data.get("promo_code")
+        if promo_code:
+            increment_promo_usage(promo_code)
+
+        user = update.effective_user
+        zone = context.user_data.get("zone", "N/A")
+        service = context.user_data.get("service", "N/A")
+        delivery_type = context.user_data.get("delivery_type", "Standard")
+        errand_items = context.user_data.get("errand_items", "")
+        scheduled_time = context.user_data.get("scheduled_time", "")
+        location_details = context.user_data.get("location_details", "Not provided")
+
+        await dispatch_confirmed_order(
+            context, str(user.id), user.id, user.full_name, user.username,
+            service, zone, location_details, errand_items, delivery_type, scheduled_time, total
+        )
+
+        new_balance = get_wallet_balance(user_id)
+        confirmation = (
+            "✅ *Paid from Wallet!*\n\n"
+            f"💳 ₦{total:,} deducted — your rider is being dispatched immediately ⚡\n"
+            f"👛 New wallet balance: ₦{new_balance:,}\n\n"
+        )
+        if delivery_type == "Scheduled" and scheduled_time:
+            confirmation += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+        confirmation += "Thank you for choosing BikeBlitz! 🚴"
+
+        await update.message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_menu())
+        context.user_data.clear()
+        return CHOOSING_SERVICE
+
     if text == "✅ Confirm Order":
         total = context.user_data.get("total", 0)
         delivery_type = context.user_data.get("delivery_type", "Standard")
@@ -2021,11 +2305,12 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prev_time, prev_zone, prev_service, prev_total = prev
             if (datetime.now() - prev_time).total_seconds() < 90 and prev_zone == zone and prev_service == service and prev_total == total:
                 context.user_data["duplicate_confirmed"] = True
+                wallet_available = get_wallet_balance(user_id) >= total
                 await update.message.reply_text(
                     "⚠️ You just placed a very similar order less than 2 minutes ago.\n\n"
                     "Tap *✅ Confirm Order* again if this is intentional (e.g. a second package).",
                     parse_mode="Markdown",
-                    reply_markup=confirm_keyboard()
+                    reply_markup=confirm_keyboard(wallet_available)
                 )
                 return CONFIRMING_ORDER
         recent[user_id] = (datetime.now(), zone, service, total)
@@ -2070,7 +2355,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AWAITING_PAYMENT_PROOF
 
-    await update.message.reply_text("Please confirm or cancel the order 👇", reply_markup=confirm_keyboard())
+    wallet_available = get_wallet_balance(update.effective_user.id) >= context.user_data.get("total", 0)
+    await update.message.reply_text("Please confirm or cancel the order 👇", reply_markup=confirm_keyboard(wallet_available))
     return CONFIRMING_ORDER
 
 
@@ -2164,6 +2450,91 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     return CHOOSING_SERVICE
 
 
+async def dispatch_confirmed_order(
+    context, customer_id_str, customer_id, customer_name, customer_username,
+    service, zone, location, errand_items, delivery_type, scheduled_time, total
+):
+    """Logs a fully-paid order and broadcasts it to the rider group. Shared by the
+    admin payment-approval path and the instant wallet-checkout path."""
+    sheet_row = log_transaction(
+        customer_name=customer_name,
+        telegram_id=customer_id,
+        service=service,
+        zone=zone,
+        location=location,
+        delivery_type=delivery_type,
+        total=total,
+    )
+
+    claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
+    claimed_orders[customer_id_str] = {
+        "customer_name": customer_name,
+        "customer_username": customer_username,
+        "customer_id": customer_id,
+        "service": service,
+        "zone": zone,
+        "location": location,
+        "errand_items": errand_items,
+        "delivery_type": delivery_type,
+        "scheduled_time": scheduled_time,
+        "total": total,
+        "rider_id": None,
+        "rider_name": None,
+        "sheet_row": sheet_row,
+        "delivered": False,
+    }
+
+    order_text = (
+        "🚴 *New Order Available!*\n\n"
+        f"🛠️ Service: {service}\n"
+    )
+    if errand_items:
+        order_text += f"📝 Items: {errand_items}\n"
+    order_text += (
+        f"🗺️ Zone: {zone}\n"
+        f"📍 Location: {location}\n"
+        f"🚴 Delivery Type: {delivery_type}\n"
+    )
+    if scheduled_time:
+        order_text += f"📅 Scheduled: {scheduled_time}\n"
+    order_text += f"💳 Total: ₦{total:,}\n"
+    order_text += f"👤 Rider earns: ₦{int(total * 0.7):,} (70%)\n\n"
+    order_text += "First to accept gets this delivery 👇"
+
+    claim_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept", callback_data=f"claim:{customer_id}")]
+    ])
+
+    try:
+        broadcast_msg = await context.bot.send_message(
+            chat_id=RIDER_GROUP_CHAT_ID,
+            text=order_text,
+            parse_mode="Markdown",
+            reply_markup=claim_keyboard,
+        )
+        claimed_orders[customer_id_str]["broadcast_message_id"] = broadcast_msg.message_id
+
+        if context.job_queue is not None:
+            context.job_queue.run_once(
+                check_unclaimed_order,
+                when=timedelta(minutes=UNCLAIMED_ALERT_MINUTES),
+                data=customer_id_str,
+                name=f"unclaimed_{customer_id_str}",
+            )
+
+        # Zone-targeted heads-up — nudge online riders whose home zone matches
+        for rider_tid in get_riders_by_zone(zone):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(rider_tid),
+                    text=f"🎯 New order in your zone ({zone})! Check the rider group to claim it.",
+                )
+            except Exception:
+                logger.exception(f"Could not send zone heads-up to rider {rider_tid}")
+    except Exception:
+        logger.exception("Failed to broadcast order to rider group")
+
+
 async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2203,84 +2574,10 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown",
         )
 
-        sheet_row = log_transaction(
-            customer_name=customer_name,
-            telegram_id=customer_id,
-            service=service,
-            zone=zone,
-            location=location,
-            delivery_type=delivery_type,
-            total=total,
+        await dispatch_confirmed_order(
+            context, customer_id_str, customer_id, customer_name, customer_username,
+            service, zone, location, errand_items, delivery_type, scheduled_time, total
         )
-
-        # Stash order details for the claim handler, then broadcast to riders
-        claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
-        claimed_orders[customer_id_str] = {
-            "customer_name": customer_name,
-            "customer_username": customer_username,
-            "customer_id": customer_id,
-            "service": service,
-            "zone": zone,
-            "location": location,
-            "errand_items": errand_items,
-            "delivery_type": delivery_type,
-            "scheduled_time": scheduled_time,
-            "total": total,
-            "rider_id": None,
-            "rider_name": None,
-            "sheet_row": sheet_row,
-            "delivered": False,
-        }
-
-        order_text = (
-            "🚴 *New Order Available!*\n\n"
-            f"🛠️ Service: {service}\n"
-        )
-        if errand_items:
-            order_text += f"📝 Items: {errand_items}\n"
-        order_text += (
-            f"🗺️ Zone: {zone}\n"
-            f"📍 Location: {location}\n"
-            f"🚴 Delivery Type: {delivery_type}\n"
-        )
-        if scheduled_time:
-            order_text += f"📅 Scheduled: {scheduled_time}\n"
-        order_text += f"💳 Total: ₦{total:,}\n"
-        order_text += f"👤 Rider earns: ₦{int(total * 0.7):,} (70%)\n\n"
-        order_text += "First to accept gets this delivery 👇"
-
-        claim_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Accept", callback_data=f"claim:{customer_id}")]
-        ])
-
-        try:
-            broadcast_msg = await context.bot.send_message(
-                chat_id=RIDER_GROUP_CHAT_ID,
-                text=order_text,
-                parse_mode="Markdown",
-                reply_markup=claim_keyboard,
-            )
-            claimed_orders[customer_id_str]["broadcast_message_id"] = broadcast_msg.message_id
-
-            if context.job_queue is not None:
-                context.job_queue.run_once(
-                    check_unclaimed_order,
-                    when=timedelta(minutes=UNCLAIMED_ALERT_MINUTES),
-                    data=customer_id_str,
-                    name=f"unclaimed_{customer_id_str}",
-                )
-
-            # Zone-targeted heads-up — nudge online riders whose home zone matches
-            for rider_tid in get_riders_by_zone(zone):
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(rider_tid),
-                        text=f"🎯 New order in your zone ({zone})! Check the rider group to claim it.",
-                    )
-                except Exception:
-                    logger.exception(f"Could not send zone heads-up to rider {rider_tid}")
-        except Exception:
-            logger.exception("Failed to broadcast order to rider group")
     else:
         await context.bot.send_message(
             chat_id=customer_id,
@@ -2661,11 +2958,24 @@ def main():
         fallbacks=[CommandHandler("apply", apply_start)],
     )
 
+    topup_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("topup", topup_start)],
+        states={
+            AWAITING_TOPUP_PROOF: [
+                MessageHandler(filters.PHOTO, handle_topup_proof),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topup_proof),
+            ],
+        },
+        fallbacks=[CommandHandler("topup", topup_start)],
+    )
+
     # Registered before the main conv_handler so an in-progress application
-    # takes priority over the customer-ordering flow for the same chat.
+    # or top-up takes priority over the customer-ordering flow for the same chat.
     app.add_handler(apply_conv_handler)
+    app.add_handler(topup_conv_handler)
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_rider_application_decision, pattern=r"^(riderapprove|riderreject):"))
+    app.add_handler(CallbackQueryHandler(handle_topup_decision, pattern=r"^(topupapprove|topupreject):"))
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
     app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
@@ -2690,6 +3000,7 @@ def main():
     app.add_handler(CommandHandler("myreferral", myreferral))
     app.add_handler(CommandHandler("referral", referral))
     app.add_handler(CommandHandler("createpromo", createpromo))
+    app.add_handler(CommandHandler("wallet", wallet))
     app.add_handler(CommandHandler("admin", admin_help))
 
     # Global handler (separate group) — catches delivery proof photos from riders
