@@ -2438,12 +2438,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "ℹ️ About BikeBlitz":
         return await about(update, context)
     elif text == "🆘 Report an Issue":
+        user = update.effective_user
+        claimed_orders = context.application.bot_data.get("claimed_orders", {})
+        order = claimed_orders.get(str(user.id))
+        has_active_delivery = bool(
+            order and order.get("rider_id") and not order.get("delivered") and not order.get("cancelled")
+        )
+
+        keyboard_rows = []
+        if has_active_delivery:
+            keyboard_rows.append([KeyboardButton("🚴 My delivery hasn't arrived yet")])
+        keyboard_rows.append([KeyboardButton("🏠 Main Menu")])
+
         await update.message.reply_text(
             "🆘 *We're here to help.*\n\n"
             "Please describe what's wrong — a late delivery, a rude rider, a payment issue, "
             "anything at all. This goes straight to our team.",
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup(keyboard_rows, resize_keyboard=True)
         )
         return AWAITING_SUPPORT_MESSAGE
     else:
@@ -2454,10 +2466,104 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHOOSING_SERVICE
 
 
+async def reassign_claimed_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Releases a customer's currently-claimed order back to the rider group after a
+    non-delivery complaint, and notifies the previous rider, the group, and the admin."""
+    user = update.effective_user
+    customer_id_str = str(user.id)
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+
+    if order is None or order.get("delivered") or order.get("cancelled") or not order.get("rider_id"):
+        await update.message.reply_text(
+            "We couldn't find an active delivery in progress for you right now. "
+            "If you're having a different issue, tell us more and we'll help.",
+            reply_markup=main_menu()
+        )
+        return CHOOSING_SERVICE
+
+    old_rider_id = order.get("rider_id")
+    old_rider_name = order.get("rider_name", "Your previous rider")
+
+    order["rider_id"] = None
+    order["rider_name"] = None
+    order["reassigned_count"] = order.get("reassigned_count", 0) + 1
+
+    try:
+        await context.bot.send_message(
+            chat_id=old_rider_id,
+            text=(
+                "⚠️ The customer reported this delivery hasn't arrived yet, so it's been "
+                "reassigned to another rider. Please don't proceed with it."
+            ),
+        )
+    except Exception:
+        logger.exception("Could not notify previous rider of reassignment")
+
+    zone = order.get("zone", "N/A")
+    location = order.get("location", "N/A")
+    total = order.get("total", 0)
+    service = order.get("service", "N/A")
+    errand_items = order.get("errand_items", "")
+
+    order_text = (
+        "🔄 *Reassigned Order — Needs a Rider!*\n\n"
+        f"🛠️ Service: {service}\n"
+    )
+    if errand_items:
+        order_text += f"📝 Items: {errand_items}\n"
+    order_text += (
+        f"🗺️ Zone: {zone}\n"
+        f"📍 Location: {location}\n"
+        f"🚴 Delivery Type: {order.get('delivery_type', 'Standard')}\n"
+        f"💳 Total: ₦{total:,}\n"
+        f"👤 Rider earns: ₦{int(total * 0.7):,} (70%)\n\n"
+        "First to accept gets this delivery 👇"
+    )
+    claim_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept", callback_data=f"claim:{order.get('customer_id')}")]
+    ])
+    try:
+        broadcast_msg = await context.bot.send_message(
+            chat_id=RIDER_GROUP_CHAT_ID,
+            text=order_text,
+            parse_mode="Markdown",
+            reply_markup=claim_keyboard,
+        )
+        order["broadcast_message_id"] = broadcast_msg.message_id
+    except Exception:
+        logger.exception("Failed to re-broadcast reassigned order to rider group")
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"🔄 *Order Reassigned*\n\n"
+                f"👤 {order.get('customer_name')} reported non-delivery.\n"
+                f"Previous rider: {old_rider_name}\n"
+                f"🗺️ {zone} — {location}\n"
+                f"💳 ₦{total:,}\n\n"
+                "Order has been reopened to the rider group."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to notify admin of reassignment")
+
+    await update.message.reply_text(
+        "✅ Got it — we've flagged this and reopened your delivery to other riders. "
+        "You'll be notified once someone new picks it up.",
+        reply_markup=main_menu()
+    )
+    return CHOOSING_SERVICE
+
+
 async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🏠 Main Menu":
         return await start(update, context)
+    if text == "🚴 My delivery hasn't arrived yet":
+        return await reassign_claimed_order(update, context)
 
     user = update.effective_user
     contact = f"@{user.username}" if user.username else f"Telegram ID {user.id}"
