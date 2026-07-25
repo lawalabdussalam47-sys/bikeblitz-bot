@@ -693,8 +693,11 @@ def deduct_wallet_balance(user_id, amount):
 
 # ---------- Keyboards ----------
 
-def main_menu():
-    keyboard = [
+def main_menu(show_reorder=False):
+    keyboard = []
+    if show_reorder:
+        keyboard.append([KeyboardButton("🔁 Reorder Last")])
+    keyboard += [
         [KeyboardButton("📦 Send a Package"), KeyboardButton("🛒 Errand / Food / Market")],
         [KeyboardButton("⚡ Express Delivery"), KeyboardButton("📅 Schedule Delivery")],
         [KeyboardButton("💰 Price Quote"), KeyboardButton("🗺️ View Zones")],
@@ -1758,7 +1761,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Fast. Reliable. Zero silence. Every order.\n\n"
         "What would you like to do today? 👇",
         parse_mode="Markdown",
-        reply_markup=main_menu()
+        reply_markup=main_menu(show_reorder=bool(last_order))
     )
     return CHOOSING_SERVICE
 
@@ -2721,6 +2724,53 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🏠 Main Menu":
         return await start(update, context)
+    elif text == "🔁 Reorder Last":
+        user = update.effective_user
+        last_order = get_customer_last_order(user.id)
+        if not last_order:
+            await update.message.reply_text(
+                "No previous order found yet. Let's start a new one! 👇",
+                reply_markup=main_menu()
+            )
+            return CHOOSING_SERVICE
+
+        service = last_order.get("Service", "B2B")
+        zone = last_order.get("Zone", "")
+        delivery_type = last_order.get("Delivery Type", "Standard")
+
+        context.user_data["service"] = service
+        context.user_data["delivery_type"] = "Express" if delivery_type == "Express" else "Standard"
+
+        if zone not in ZONE_PRICES:
+            # Zone list may have changed since — fall back to a normal zone pick
+            context.user_data["zone"] = None
+            await update.message.reply_text(
+                "🔁 Reordering — let's confirm your delivery zone 👇",
+                parse_mode="Markdown",
+                reply_markup=zone_keyboard()
+            )
+            return CHOOSING_ZONE
+
+        context.user_data["zone"] = zone
+
+        if service == "B2B":
+            await update.message.reply_text(
+                f"🔁 *Reordering your last delivery*\n\n"
+                f"🗺️ Zone: {zone}\n\n"
+                "How heavy is your package this time? 👇",
+                parse_mode="Markdown",
+                reply_markup=weight_keyboard()
+            )
+            return CHOOSING_WEIGHT
+        else:
+            await update.message.reply_text(
+                f"🔁 *Reordering your last delivery*\n\n"
+                f"🗺️ Zone: {zone}\n\n"
+                "What type of errand is this? 👇",
+                parse_mode="Markdown",
+                reply_markup=errand_keyboard()
+            )
+            return CHOOSING_ERRAND
     elif text in ("📦 Send a Package", "📦 Package Delivery"):
         context.user_data["service"] = "B2B"
         if not context.user_data.get("delivery_type"):
