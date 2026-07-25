@@ -342,6 +342,13 @@ REFERRAL_BONUS_REFERRER = 200
 REFERRAL_BONUS_REFERRED = 100
 REFERRAL_CREDIT_MAX_PERCENT = 50  # credit can cover at most this % of a single order's total
 
+# --- Rider quality monitoring ---
+LOW_RATING_THRESHOLD = 3.0
+LOW_RATING_MIN_RATINGS = 3  # don't flag until a rider has at least this many ratings
+
+# --- Loyalty program ---
+LOYALTY_FREE_EVERY = 10  # every Nth completed order is free (0 disables the program)
+
 ZONE_LOCATIONS = {
     "Zone 1 - On Campus": "Anywhere within FUNAAB campus",
     "Zone 2 - Near Off Campus": "Harmony, Accord, Zoo, Agbede, Kofesu",
@@ -810,6 +817,30 @@ def record_rating(customer_name, rider_name, rider_id, stars):
         logger.exception("Failed to record rating")
 
 
+def get_rider_rating_stats(rider_id):
+    """Returns {'count': int, 'average': float} for a rider's ratings, or None if no ratings yet."""
+    try:
+        ss = get_spreadsheet()
+        if ss is None:
+            return None
+        import gspread
+        try:
+            ws = ss.worksheet("Ratings")
+        except gspread.exceptions.WorksheetNotFound:
+            return None
+        records = ws.get_all_records()
+        matches = [r for r in records if str(r.get("Rider ID", "")) == str(rider_id)]
+        if not matches:
+            return None
+        stars_list = [int(r.get("Stars", 0) or 0) for r in matches]
+        count = len(stars_list)
+        average = sum(stars_list) / count if count else 0
+        return {"count": count, "average": average}
+    except Exception:
+        logger.exception("Failed to compute rider rating stats")
+        return None
+
+
 def get_all_customer_ids():
     """Return a sorted list of unique customer Telegram IDs from the Transactions sheet."""
     try:
@@ -968,6 +999,30 @@ async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Could not notify rider of rating")
 
+    # Low-rating monitoring — alert admin once when a rider's average dips below threshold
+    rating_stats = get_rider_rating_stats(rider_id_str)
+    if rating_stats and rating_stats["count"] >= LOW_RATING_MIN_RATINGS:
+        flagged = context.application.bot_data.setdefault("flagged_riders", set())
+        if rating_stats["average"] < LOW_RATING_THRESHOLD:
+            if rider_id_str not in flagged:
+                flagged.add(rider_id_str)
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=(
+                            f"🚩 *Low Rating Alert*\n\n"
+                            f"👤 Rider: {rider_name}\n"
+                            f"🆔 {rider_id_str}\n"
+                            f"⭐ Average: {rating_stats['average']:.1f} over {rating_stats['count']} ratings\n\n"
+                            "You may want to check in with this rider."
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    logger.exception("Failed to send low rating alert")
+        else:
+            flagged.discard(rider_id_str)
+
 
 def get_customer_orders(telegram_id, limit=5):
     """Return a customer's most recent orders (up to limit), most recent first."""
@@ -981,6 +1036,22 @@ def get_customer_orders(telegram_id, limit=5):
     except Exception:
         logger.exception("Failed to fetch customer order history")
         return []
+
+
+def get_customer_completed_count(telegram_id):
+    """Count a customer's Delivered orders — used to track loyalty milestones."""
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return 0
+        records = sheet.get_all_records()
+        return sum(
+            1 for r in records
+            if str(r.get("Telegram ID", "")) == str(telegram_id) and r.get("Status") == "Delivered"
+        )
+    except Exception:
+        logger.exception("Failed to count completed orders")
+        return 0
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1024,6 +1095,17 @@ async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{status_emoji} {o.get('Timestamp', 'N/A')} — {o.get('Zone', 'N/A')} — "
             f"₦{o.get('Total', 0):,} ({o.get('Status', 'Unknown')})"
         )
+
+    if LOYALTY_FREE_EVERY > 0:
+        completed = get_customer_completed_count(user.id)
+        next_number = completed + 1
+        mod = next_number % LOYALTY_FREE_EVERY
+        if mod == 0:
+            lines.append("\n🎉 Your next delivery is FREE!")
+        else:
+            remaining = LOYALTY_FREE_EVERY - mod
+            lines.append(f"\n🎉 {remaining} more delivery(s) until your next one is FREE!")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1704,6 +1786,33 @@ async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to update rider group broadcast after cancellation")
 
 
+async def riderrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/riderrating TELEGRAM_ID`",
+            parse_mode="Markdown"
+        )
+        return
+
+    rider_id = context.args[0]
+    stats = get_rider_rating_stats(rider_id)
+    if stats is None:
+        await update.message.reply_text("No ratings found for that rider yet.")
+        return
+
+    flag = "🚩 Below threshold" if stats["average"] < LOW_RATING_THRESHOLD else "✅ Healthy"
+    await update.message.reply_text(
+        f"⭐ *Rider Rating*\n\n"
+        f"🆔 {rider_id}\n"
+        f"Average: {stats['average']:.1f} over {stats['count']} ratings\n"
+        f"Status: {flag}",
+        parse_mode="Markdown"
+    )
+
+
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # silently ignore — this is admin-only
@@ -1717,7 +1826,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Riders*\n"
         "`/whosonline` — riders currently online\n"
         "`/leaderboard` — top riders by deliveries\n"
-        "New `/apply` submissions arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
+        "`/riderrating TELEGRAM_ID` — check a rider's average rating\n"
+        "New `/apply` submissions arrive automatically with Approve/Reject buttons — nothing to run manually.\n"
+        f"You'll also get an automatic 🚩 alert if a rider's average drops below {LOW_RATING_THRESHOLD} "
+        f"(after at least {LOW_RATING_MIN_RATINGS} ratings).\n\n"
         "*Wallet*\n"
         "Customer `/topup` requests arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
         "*Setup*\n"
@@ -2153,6 +2265,15 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data["total"] = total
 
+    # Loyalty program — every Nth completed order is free
+    completed_count = get_customer_completed_count(update.effective_user.id)
+    is_loyalty_free = LOYALTY_FREE_EVERY > 0 and (completed_count + 1) % LOYALTY_FREE_EVERY == 0
+    context.user_data["loyalty_free"] = is_loyalty_free
+    if is_loyalty_free:
+        breakdown += f"🎉 *Loyalty Reward:* This is delivery #{completed_count + 1} — it's on us, FREE! 🎊\n"
+        total = 0
+        context.user_data["total"] = 0
+
     if service == "B2B":
         breakdown += (
             f"━━━━━━━━━━━━━━━━\n"
@@ -2173,12 +2294,20 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
         scheduled_time = context.user_data.get("scheduled_time", "")
         breakdown += f"\n📅 Scheduled for: *{scheduled_time}*"
 
-    wallet_balance = get_wallet_balance(update.effective_user.id)
-    wallet_available = wallet_balance >= total
-    if wallet_available:
-        breakdown += f"\n\n👛 Wallet balance: ₦{wallet_balance:,} — pay instantly, no screenshot needed!"
+    if context.user_data.get("loyalty_free"):
+        reply_markup = ReplyKeyboardMarkup([
+            [KeyboardButton("✅ Confirm Order")],
+            [KeyboardButton("❌ Cancel Order")],
+            [KeyboardButton("🏠 Main Menu")],
+        ], resize_keyboard=True)
+    else:
+        wallet_balance = get_wallet_balance(update.effective_user.id)
+        wallet_available = wallet_balance >= total
+        if wallet_available:
+            breakdown += f"\n\n👛 Wallet balance: ₦{wallet_balance:,} — pay instantly, no screenshot needed!"
+        reply_markup = confirm_keyboard(wallet_available)
 
-    await update.message.reply_text(breakdown, parse_mode="Markdown", reply_markup=confirm_keyboard(wallet_available))
+    await update.message.reply_text(breakdown, parse_mode="Markdown", reply_markup=reply_markup)
     return CONFIRMING_ORDER
 
 
@@ -2317,6 +2446,36 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return CONFIRMING_ORDER
         recent[user_id] = (datetime.now(), zone, service, total)
+
+        # Loyalty freebie — nothing to collect, dispatch immediately like the wallet path
+        if context.user_data.get("loyalty_free"):
+            credit_applied = context.user_data.get("credit_applied", 0)
+            if credit_applied:
+                deduct_credit(user_id, credit_applied)
+            promo_code = context.user_data.get("promo_code")
+            if promo_code:
+                increment_promo_usage(promo_code)
+
+            user = update.effective_user
+            errand_items = context.user_data.get("errand_items", "")
+            location_details = context.user_data.get("location_details", "Not provided")
+
+            await dispatch_confirmed_order(
+                context, str(user.id), user.id, user.full_name, user.username,
+                service, zone, location_details, errand_items, delivery_type, scheduled_time, total
+            )
+
+            confirmation = (
+                "🎉 *Loyalty Reward Applied!*\n\n"
+                "This delivery is on us — your rider is being dispatched immediately ⚡\n\n"
+            )
+            if delivery_type == "Scheduled" and scheduled_time:
+                confirmation += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+            confirmation += "Thank you for being a loyal BikeBlitz customer! 🚴"
+
+            await update.message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_menu())
+            context.user_data.clear()
+            return CHOOSING_SERVICE
 
         # Settle referral credit and promo code usage now that the order is truly confirmed
         credit_applied = context.user_data.get("credit_applied", 0)
@@ -3051,6 +3210,7 @@ def main():
     app.add_handler(CommandHandler("referral", referral))
     app.add_handler(CommandHandler("createpromo", createpromo))
     app.add_handler(CommandHandler("wallet", wallet))
+    app.add_handler(CommandHandler("riderrating", riderrating))
     app.add_handler(CommandHandler("admin", admin_help))
 
     # Global handler (separate group) — catches delivery proof photos from riders
