@@ -1,4 +1,7 @@
 import os
+import csv
+import io
+import dateparser
 import json
 import logging
 from datetime import datetime, timedelta, time as dt_time
@@ -320,6 +323,7 @@ logger = logging.getLogger(__name__)
 ) = range(12, 18)
 
 (AWAITING_TOPUP_PROOF,) = range(18, 19)
+(ADD_MORE_PACKAGES,) = range(19, 20)
 
 # Pricing
 ZONE_PRICES = {
@@ -348,6 +352,12 @@ LOW_RATING_MIN_RATINGS = 3  # don't flag until a rider has at least this many ra
 
 # --- Loyalty program ---
 LOYALTY_FREE_EVERY = 10  # every Nth completed order is free (0 disables the program)
+
+# --- Win-back nudges ---
+WIN_BACK_DAYS = 14  # nudge customers who haven't ordered in this many days
+
+# --- Scheduled delivery broadcasting ---
+SCHEDULED_BROADCAST_LEAD_MINUTES = 30  # broadcast to riders this long before a scheduled time
 
 ZONE_LOCATIONS = {
     "Zone 1 - On Campus": "Anywhere within FUNAAB campus",
@@ -698,6 +708,71 @@ def deduct_wallet_balance(user_id, amount):
         return False
 
 
+# ---------- Blocklist helpers ----------
+
+def get_blocklist_sheet():
+    """Returns the 'Blocklist' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Blocklist")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Blocklist", rows=200, cols=4)
+            ws.append_row(["Telegram ID", "Name", "Reason", "Blocked At"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Blocklist worksheet")
+        return None
+
+
+def is_blocked(user_id):
+    try:
+        ws = get_blocklist_sheet()
+        if ws is None:
+            return False
+        records = ws.get_all_records()
+        return any(str(r.get("Telegram ID", "")) == str(user_id) for r in records)
+    except Exception:
+        logger.exception("Failed to check blocklist")
+        return False
+
+
+def block_user(user_id, name, reason):
+    try:
+        ws = get_blocklist_sheet()
+        if ws is None:
+            return False
+        rows = ws.get_all_values()
+        for row in rows[1:]:
+            if len(row) > 0 and row[0] == str(user_id):
+                return True  # already blocked
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([str(user_id), name, reason or "No reason given", timestamp])
+        return True
+    except Exception:
+        logger.exception("Failed to block user")
+        return False
+
+
+def unblock_user(user_id):
+    try:
+        ws = get_blocklist_sheet()
+        if ws is None:
+            return False
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                ws.delete_rows(idx)
+                return True
+        return False
+    except Exception:
+        logger.exception("Failed to unblock user")
+        return False
+
+
 # ---------- Keyboards ----------
 
 def main_menu(show_reorder=False):
@@ -853,6 +928,99 @@ def get_all_customer_ids():
     except Exception:
         logger.exception("Failed to fetch customer IDs for broadcast")
         return []
+
+
+# ---------- Win-back nudge helpers ----------
+
+def get_nudges_sheet():
+    """Returns the 'Nudges' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Nudges")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Nudges", rows=500, cols=2)
+            ws.append_row(["Telegram ID", "Last Nudge Sent"])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Nudges worksheet")
+        return None
+
+
+def get_last_nudge_date(user_id):
+    try:
+        ws = get_nudges_sheet()
+        if ws is None:
+            return None
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(user_id):
+                try:
+                    return datetime.strptime(str(r.get("Last Nudge Sent")), "%Y-%m-%d")
+                except ValueError:
+                    return None
+        return None
+    except Exception:
+        logger.exception("Failed to fetch last nudge date")
+        return None
+
+
+def set_last_nudge_date(user_id):
+    try:
+        ws = get_nudges_sheet()
+        if ws is None:
+            return
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == str(user_id):
+                ws.update(f"B{idx}", [[today_str]])
+                return
+        ws.append_row([str(user_id), today_str])
+    except Exception:
+        logger.exception("Failed to update last nudge date")
+
+
+async def send_win_back_nudges(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job — nudges customers who haven't ordered in WIN_BACK_DAYS days."""
+    if WIN_BACK_DAYS <= 0:
+        return
+    customer_ids = get_all_customer_ids()
+    now = datetime.now()
+
+    for cid in customer_ids:
+        last_order = get_customer_last_order(cid)
+        if not last_order:
+            continue
+        try:
+            last_ts = datetime.strptime(str(last_order.get("Timestamp", "")), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if (now - last_ts).days < WIN_BACK_DAYS:
+            continue
+
+        last_nudge = get_last_nudge_date(cid)
+        if last_nudge and (now - last_nudge).days < WIN_BACK_DAYS:
+            continue
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(cid),
+                text=(
+                    "👋 *We miss you at BikeBlitz!*\n\n"
+                    "It's been a while since your last order. We're still here — fast campus "
+                    "delivery and errands, same-day. \n\n"
+                    "Tap /start to place an order, or check `/myorders` to see how close you "
+                    "are to a free delivery! 🎉"
+                ),
+                parse_mode="Markdown",
+            )
+            set_last_nudge_date(cid)
+        except Exception:
+            logger.exception(f"Could not send win-back nudge to {cid}")
 
 
 def record_rider_status(rider_id, rider_name, availability):
@@ -1786,6 +1954,45 @@ async def handle_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to update rider group broadcast after cancellation")
 
 
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/block TELEGRAM_ID [reason]`",
+            parse_mode="Markdown"
+        )
+        return
+
+    user_id = context.args[0]
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    success = block_user(user_id, "Unknown", reason)
+    if success:
+        await update.message.reply_text(f"🚫 {user_id} has been blocked.")
+    else:
+        await update.message.reply_text("Something went wrong — try again shortly.")
+
+
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/unblock TELEGRAM_ID`",
+            parse_mode="Markdown"
+        )
+        return
+
+    user_id = context.args[0]
+    success = unblock_user(user_id)
+    if success:
+        await update.message.reply_text(f"✅ {user_id} has been unblocked.")
+    else:
+        await update.message.reply_text("That ID wasn't on the blocklist.")
+
+
 async def riderrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # admin-only, silently ignore otherwise
@@ -1813,6 +2020,41 @@ async def riderrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def export_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    sheet = get_sheet()
+    if sheet is None:
+        await update.message.reply_text("Google Sheets isn't configured yet.")
+        return
+
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to fetch transactions for export")
+        await update.message.reply_text("Couldn't load the transactions right now — try again shortly.")
+        return
+
+    if not rows:
+        await update.message.reply_text("No transactions logged yet.")
+        return
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(rows)
+    file_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
+    filename = f"bikeblitz_transactions_{datetime.now().strftime('%Y%m%d')}.csv"
+    file_bytes.name = filename
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=file_bytes,
+        filename=filename,
+        caption=f"📊 Full transactions export — {len(rows) - 1} orders",
+    )
+
+
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # silently ignore — this is admin-only
@@ -1821,6 +2063,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠️ *Admin Commands*\n\n"
         "*Orders & Money*\n"
         "`/stats` — today's & all-time orders/revenue\n"
+        "`/export` — download full transactions as CSV\n"
         "`/broadcast msg` — message every past customer\n"
         "`/createpromo CODE TYPE VALUE MAXUSES [EXPIRY]` — create a promo code\n\n"
         "*Riders*\n"
@@ -1834,6 +2077,9 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Customer `/topup` requests arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
         "*Setup*\n"
         "`/groupid` — get the chat ID of any chat (e.g. the rider group)\n\n"
+        "*Trust & Safety*\n"
+        "`/block TELEGRAM_ID [reason]` — restrict a customer or rider\n"
+        "`/unblock TELEGRAM_ID` — lift a restriction\n\n"
         "_This menu only responds to the admin account._",
         parse_mode="Markdown",
     )
@@ -2040,10 +2286,53 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scheduled_time = update.message.text
-    context.user_data["scheduled_time"] = scheduled_time
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    retry_keyboard = ReplyKeyboardMarkup([[KeyboardButton("🏠 Main Menu")]], resize_keyboard=True)
+
+    parsed = dateparser.parse(
+        text,
+        settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False}
+    )
+    if parsed is None:
+        await update.message.reply_text(
+            "Sorry, I couldn't understand that date/time.\n\n"
+            "Try something like _Tomorrow 2pm_ or _Monday 10am_.",
+            parse_mode="Markdown",
+            reply_markup=retry_keyboard
+        )
+        return SCHEDULING_TIME
+
+    now = datetime.now()
+    if parsed < now + timedelta(hours=1):
+        await update.message.reply_text(
+            "⏰ Scheduled deliveries need at least 1 hour's notice. Please pick a later time.",
+            reply_markup=retry_keyboard
+        )
+        return SCHEDULING_TIME
+
+    if parsed.hour < 9 or parsed.hour >= 21:
+        await update.message.reply_text(
+            "🕒 We only operate 9am–9pm. Please pick a time in that window.",
+            reply_markup=retry_keyboard
+        )
+        return SCHEDULING_TIME
+
+    if parsed.date() == now.date() and parsed.hour >= 20:
+        await update.message.reply_text(
+            "🌙 Same-day scheduling closes at 8pm. Please pick an earlier time today, or a time tomorrow.",
+            reply_markup=retry_keyboard
+        )
+        return SCHEDULING_TIME
+
+    scheduled_display = parsed.strftime("%a, %d %b %Y — %I:%M %p")
+    context.user_data["scheduled_time"] = scheduled_display
+    context.user_data["scheduled_datetime"] = parsed.isoformat()
+
     await update.message.reply_text(
-        f"✅ Got it! Scheduled for: *{scheduled_time}*\n\n"
+        f"✅ Got it! Scheduled for: *{scheduled_display}*\n\n"
         "Now, is this a package delivery or an errand? 👇",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup([
@@ -2145,14 +2434,51 @@ async def handle_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CHOOSING_SERVICE
 
-    context.user_data["weight"] = weight
+    packages = context.user_data.setdefault("packages", [])
+    packages.append(weight)
+    context.user_data["weight"] = weight  # kept for backward-compat display use
+
     await update.message.reply_text(
-        f"✅ Weight: *{weight}*\n\n"
-        "Is your dropoff location close to the main bus stop or far from it? 👇",
+        f"✅ Package #{len(packages)} weight: *{weight}*\n\n"
+        "Got another package for this same delivery, or ready to continue? 👇",
         parse_mode="Markdown",
-        reply_markup=busstop_keyboard()
+        reply_markup=ReplyKeyboardMarkup([
+            [KeyboardButton("➕ Add Another Package")],
+            [KeyboardButton("✅ Continue")],
+            [KeyboardButton("🏠 Main Menu")],
+        ], resize_keyboard=True)
     )
-    return CHOOSING_BUSSTOP
+    return ADD_MORE_PACKAGES
+
+
+async def handle_add_more_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    if text == "➕ Add Another Package":
+        await update.message.reply_text(
+            "How heavy is the next package? 👇",
+            reply_markup=weight_keyboard()
+        )
+        return CHOOSING_WEIGHT
+
+    if text == "✅ Continue":
+        await update.message.reply_text(
+            "Is your dropoff location close to the main bus stop or far from it? 👇",
+            reply_markup=busstop_keyboard()
+        )
+        return CHOOSING_BUSSTOP
+
+    await update.message.reply_text(
+        "Please choose an option 👇",
+        reply_markup=ReplyKeyboardMarkup([
+            [KeyboardButton("➕ Add Another Package")],
+            [KeyboardButton("✅ Continue")],
+            [KeyboardButton("🏠 Main Menu")],
+        ], resize_keyboard=True)
+    )
+    return ADD_MORE_PACKAGES
 
 
 async def handle_busstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2199,8 +2525,8 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
     location_details = context.user_data.get("location_details", "")
 
     if service == "B2B":
-        weight = context.user_data.get("weight")
-        base_price = ZONE_PRICES[zone][weight]
+        packages = context.user_data.get("packages") or [context.user_data.get("weight", "Light")]
+        base_price = sum(ZONE_PRICES[zone][w] for w in packages)
         distance_add = DISTANCE_MODIFIER if far_from_busstop else 0
         express_add = EXPRESS_SURCHARGE if delivery_type == "Express" else 0
         total = base_price + distance_add + express_add
@@ -2210,11 +2536,11 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
             f"📦 Service: Package Delivery\n"
             f"🗺️ Zone: {zone}\n"
             f"📍 Location: {location_details}\n"
-            f"⚖️ Weight: {weight}\n"
+            f"⚖️ Package(s): {', '.join(f'#{i+1} {w}' for i, w in enumerate(packages))}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
             f"📍 Far from bus stop: {'Yes' if far_from_busstop else 'No'}\n\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"💰 Base price: ₦{base_price:,}\n"
+            f"💰 Base price ({len(packages)} package{'s' if len(packages) != 1 else ''}): ₦{base_price:,}\n"
         )
         if distance_add:
             breakdown += f"📍 Distance modifier: +₦{distance_add:,}\n"
@@ -2405,7 +2731,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await dispatch_confirmed_order(
             context, str(user.id), user.id, user.full_name, user.username,
-            service, zone, location_details, errand_items, delivery_type, scheduled_time, total
+            service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
+            scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None
         )
 
         new_balance = get_wallet_balance(user_id)
@@ -2462,7 +2789,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await dispatch_confirmed_order(
                 context, str(user.id), user.id, user.full_name, user.username,
-                service, zone, location_details, errand_items, delivery_type, scheduled_time, total
+                service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
+                scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None
             )
 
             confirmation = (
@@ -2541,7 +2869,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     service = context.user_data.get("service", "N/A")
     delivery_type = context.user_data.get("delivery_type", "Standard")
     total = context.user_data.get("total", 0)
-    weight = context.user_data.get("weight")
+    packages = context.user_data.get("packages", [])
     errand_type = context.user_data.get("errand_type")
     errand_items = context.user_data.get("errand_items", "")
     scheduled_time = context.user_data.get("scheduled_time", "")
@@ -2549,11 +2877,12 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     promo_code = context.user_data.get("promo_code")
     credit_applied = context.user_data.get("credit_applied", 0)
 
+    packages_note = f"- {len(packages)} package(s): {', '.join(packages)}" if packages else ""
     summary = (
         f"💰 *New Payment Received*\n\n"
         f"👤 Customer: {user.full_name} (@{user.username or 'no username'})\n"
         f"🆔 Telegram ID: {user.id}\n"
-        f"🛠️ Service: {service} {f'- {weight}' if weight else ''}{f'- {errand_type}' if errand_type else ''}\n"
+        f"🛠️ Service: {service} {packages_note}{f'- {errand_type}' if errand_type else ''}\n"
     )
     if errand_items:
         summary += f"📝 Items: {errand_items}\n"
@@ -2582,6 +2911,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         "total": total,
         "delivery_type": delivery_type,
         "scheduled_time": scheduled_time,
+        "scheduled_datetime": context.user_data.get("scheduled_datetime", ""),
         "service": service,
         "zone": zone,
         "location": location_details,
@@ -2612,39 +2942,25 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     return CHOOSING_SERVICE
 
 
-async def dispatch_confirmed_order(
-    context, customer_id_str, customer_id, customer_name, customer_username,
-    service, zone, location, errand_items, delivery_type, scheduled_time, total
-):
-    """Logs a fully-paid order and broadcasts it to the rider group. Shared by the
-    admin payment-approval path and the instant wallet-checkout path."""
-    sheet_row = log_transaction(
-        customer_name=customer_name,
-        telegram_id=customer_id,
-        service=service,
-        zone=zone,
-        location=location,
-        delivery_type=delivery_type,
-        total=total,
-    )
+async def broadcast_order_to_riders(context, customer_id_str):
+    """Broadcasts a stored claimed_orders entry to the rider group, schedules the
+    unclaimed-order alert, and pings zone-matched riders. Used both for immediate
+    dispatch and for scheduled deliveries whose broadcast was delayed."""
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+    if order is None:
+        return
+    if order.get("cancelled") or order.get("rider_id"):
+        return  # already handled or cancelled before broadcast time
 
-    claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
-    claimed_orders[customer_id_str] = {
-        "customer_name": customer_name,
-        "customer_username": customer_username,
-        "customer_id": customer_id,
-        "service": service,
-        "zone": zone,
-        "location": location,
-        "errand_items": errand_items,
-        "delivery_type": delivery_type,
-        "scheduled_time": scheduled_time,
-        "total": total,
-        "rider_id": None,
-        "rider_name": None,
-        "sheet_row": sheet_row,
-        "delivered": False,
-    }
+    service = order.get("service", "N/A")
+    zone = order.get("zone", "N/A")
+    location = order.get("location", "N/A")
+    errand_items = order.get("errand_items", "")
+    delivery_type = order.get("delivery_type", "Standard")
+    scheduled_time = order.get("scheduled_time", "")
+    total = order.get("total", 0)
+    customer_id = order.get("customer_id")
 
     order_text = (
         "🚴 *New Order Available!*\n\n"
@@ -2674,7 +2990,7 @@ async def dispatch_confirmed_order(
             parse_mode="Markdown",
             reply_markup=claim_keyboard,
         )
-        claimed_orders[customer_id_str]["broadcast_message_id"] = broadcast_msg.message_id
+        order["broadcast_message_id"] = broadcast_msg.message_id
 
         if context.job_queue is not None:
             context.job_queue.run_once(
@@ -2697,6 +3013,62 @@ async def dispatch_confirmed_order(
         logger.exception("Failed to broadcast order to rider group")
 
 
+async def scheduled_broadcast_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback — fires shortly before a scheduled delivery's time to broadcast it."""
+    customer_id_str = context.job.data
+    await broadcast_order_to_riders(context, customer_id_str)
+
+
+async def dispatch_confirmed_order(
+    context, customer_id_str, customer_id, customer_name, customer_username,
+    service, zone, location, errand_items, delivery_type, scheduled_time, total,
+    scheduled_dt=None
+):
+    """Logs a fully-paid order and either broadcasts it to the rider group immediately,
+    or — for scheduled deliveries far enough out — queues the broadcast for closer to
+    the scheduled time. Shared by the admin payment-approval, wallet, and loyalty paths."""
+    sheet_row = log_transaction(
+        customer_name=customer_name,
+        telegram_id=customer_id,
+        service=service,
+        zone=zone,
+        location=location,
+        delivery_type=delivery_type,
+        total=total,
+    )
+
+    claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
+    claimed_orders[customer_id_str] = {
+        "customer_name": customer_name,
+        "customer_username": customer_username,
+        "customer_id": customer_id,
+        "service": service,
+        "zone": zone,
+        "location": location,
+        "errand_items": errand_items,
+        "delivery_type": delivery_type,
+        "scheduled_time": scheduled_time,
+        "total": total,
+        "rider_id": None,
+        "rider_name": None,
+        "sheet_row": sheet_row,
+        "delivered": False,
+    }
+
+    lead_seconds = SCHEDULED_BROADCAST_LEAD_MINUTES * 60
+    if scheduled_dt and (scheduled_dt - datetime.now()).total_seconds() > lead_seconds:
+        if context.job_queue is not None:
+            delay = (scheduled_dt - datetime.now()) - timedelta(seconds=lead_seconds)
+            context.job_queue.run_once(
+                scheduled_broadcast_job,
+                when=delay,
+                data=customer_id_str,
+                name=f"scheduled_broadcast_{customer_id_str}",
+            )
+            return
+    await broadcast_order_to_riders(context, customer_id_str)
+
+
 async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2713,16 +3085,31 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         total = order.get("total", 0) if order else 0
         delivery_type = order.get("delivery_type", "Standard") if order else "Standard"
         scheduled_time = order.get("scheduled_time", "") if order else ""
+        scheduled_datetime_str = order.get("scheduled_datetime", "") if order else ""
         service = order.get("service", "N/A") if order else "N/A"
         zone = order.get("zone", "N/A") if order else "N/A"
         location = order.get("location", "N/A") if order else "N/A"
         errand_items = order.get("errand_items", "") if order else ""
 
+        scheduled_dt = None
+        if scheduled_datetime_str:
+            try:
+                scheduled_dt = datetime.fromisoformat(scheduled_datetime_str)
+            except ValueError:
+                scheduled_dt = None
+
+        is_delayed_schedule = bool(
+            scheduled_dt and (scheduled_dt - datetime.now()).total_seconds() > SCHEDULED_BROADCAST_LEAD_MINUTES * 60
+        )
+
         msg = (
             "✅ *Payment Confirmed!*\n\n"
             f"Your delivery charge of ₦{total:,} has been verified.\n\n"
-            "Your rider will be dispatched immediately ⚡\n\n"
         )
+        if is_delayed_schedule:
+            msg += f"Your rider will be assigned closer to your scheduled time ⏰\n\n"
+        else:
+            msg += "Your rider will be dispatched immediately ⚡\n\n"
         if delivery_type == "Scheduled" and scheduled_time:
             msg += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
         msg += "Thank you for choosing BikeBlitz! 🚴"
@@ -2738,7 +3125,8 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
 
         await dispatch_confirmed_order(
             context, customer_id_str, customer_id, customer_name, customer_username,
-            service, zone, location, errand_items, delivery_type, scheduled_time, total
+            service, zone, location, errand_items, delivery_type, scheduled_time, total,
+            scheduled_dt=scheduled_dt
         )
     else:
         await context.bot.send_message(
@@ -2821,6 +3209,10 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer(f"Already claimed by {order.get('rider_name')}.", show_alert=True)
         return
 
+    if is_blocked(query.from_user.id):
+        await query.answer("Your account has been restricted. Contact the admin.", show_alert=True)
+        return
+
     rider = query.from_user
     order["rider_id"] = rider.id
     order["rider_name"] = rider.full_name
@@ -2880,6 +3272,20 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+
+    order_initiating_texts = (
+        "📦 Send a Package", "📦 Package Delivery",
+        "🛒 Errand / Food / Market", "🛒 Errand / Food / Market Run",
+        "⚡ Express Delivery", "📅 Schedule Delivery", "🔁 Reorder Last",
+    )
+    if text in order_initiating_texts and is_blocked(update.effective_user.id):
+        await update.message.reply_text(
+            "🚫 Your account has been restricted from placing orders.\n\n"
+            "If you believe this is a mistake, contact us:\n"
+            "📱 WhatsApp: 08144124522",
+            reply_markup=main_menu()
+        )
+        return CHOOSING_SERVICE
 
     if text == "🏠 Main Menu":
         return await start(update, context)
@@ -3138,6 +3544,7 @@ def main():
             CHOOSING_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
             CHOOSING_ZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_zone)],
             CHOOSING_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_weight)],
+            ADD_MORE_PACKAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_more_packages)],
             CHOOSING_BUSSTOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_busstop)],
             CHOOSING_LOCATION_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_details)],
             AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message)],
@@ -3211,6 +3618,9 @@ def main():
     app.add_handler(CommandHandler("createpromo", createpromo))
     app.add_handler(CommandHandler("wallet", wallet))
     app.add_handler(CommandHandler("riderrating", riderrating))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+    app.add_handler(CommandHandler("export", export_transactions))
     app.add_handler(CommandHandler("admin", admin_help))
 
     # Global handler (separate group) — catches delivery proof photos from riders
@@ -3230,6 +3640,12 @@ def main():
             send_cutoff_reminder,
             time=dt_time(hour=18, minute=30),
             name="cutoff_reminder",
+        )
+        # Daily win-back nudge check — 11 AM WAT (10:00 UTC)
+        app.job_queue.run_daily(
+            send_win_back_nudges,
+            time=dt_time(hour=10, minute=0),
+            name="win_back_nudges",
         )
 
     # --- Webhook setup for Render ---
