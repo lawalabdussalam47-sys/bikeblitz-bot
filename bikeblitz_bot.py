@@ -1,4 +1,4 @@
-import os
+importimport os
 import csv
 import io
 import dateparser
@@ -290,6 +290,77 @@ def get_rider_stats(rider_id):
         logger.exception("Failed to fetch rider stats")
         return None
 
+
+def add_rider_payout(rider_id, amount):
+    """Records a cash/transfer payout to a rider in column I, creating it if needed."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return False
+        rows = ws.get_all_values()
+        if rows and len(rows[0]) < 9:
+            ws.update("I1", [["Paid Out"]])
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                current = int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else 0
+                ws.update(f"I{idx}", [[current + amount]])
+                return True
+        return False
+    except Exception:
+        logger.exception("Failed to record rider payout")
+        return False
+
+
+def get_rider_paid_out(rider_id):
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return 0
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(rider_id):
+                return int(r.get("Paid Out", 0) or 0)
+        return 0
+    except Exception:
+        logger.exception("Failed to fetch rider paid-out amount")
+        return 0
+
+
+def record_rider_reassignment(rider_id):
+    """Increments a rider's reassignment/no-show count in column J, creating it if needed."""
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return 0
+        rows = ws.get_all_values()
+        if rows and len(rows[0]) < 10:
+            ws.update("J1", [["Reassignment Count"]])
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                current = int(row[9]) if len(row) > 9 and str(row[9]).isdigit() else 0
+                new_count = current + 1
+                ws.update(f"J{idx}", [[new_count]])
+                return new_count
+        return 0
+    except Exception:
+        logger.exception("Failed to record rider reassignment")
+        return 0
+
+
+def get_rider_reassignment_count(rider_id):
+    try:
+        ws = get_riders_sheet()
+        if ws is None:
+            return 0
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID")) == str(rider_id):
+                return int(r.get("Reassignment Count", 0) or 0)
+        return 0
+    except Exception:
+        logger.exception("Failed to fetch rider reassignment count")
+        return 0
+
 # Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -349,6 +420,9 @@ REFERRAL_CREDIT_MAX_PERCENT = 50  # credit can cover at most this % of a single 
 # --- Rider quality monitoring ---
 LOW_RATING_THRESHOLD = 3.0
 LOW_RATING_MIN_RATINGS = 3  # don't flag until a rider has at least this many ratings
+
+# --- Rider reliability monitoring ---
+RELIABILITY_MAX_REASSIGNMENTS = 2  # alert admin once a rider hits this many reassignments/no-shows
 
 # --- Loyalty program ---
 LOYALTY_FREE_EVERY = 10  # every Nth completed order is free (0 disables the program)
@@ -1085,6 +1159,34 @@ async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_rider_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global location handler — relays a rider's shared (including live) location to
+    whichever customer they currently have an active claimed delivery for."""
+    message = update.effective_message
+    if message is None or message.location is None:
+        return
+
+    rider_id = update.effective_user.id
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = None
+    for o in claimed_orders.values():
+        if o.get("rider_id") == rider_id and not o.get("delivered") and not o.get("cancelled"):
+            order = o
+            break
+
+    if order is None:
+        return  # not a rider mid-delivery — ignore, let other handlers process it
+
+    try:
+        await context.bot.send_location(
+            chat_id=order.get("customer_id"),
+            latitude=message.location.latitude,
+            longitude=message.location.longitude,
+        )
+    except Exception:
+        logger.exception("Could not forward rider location to customer")
+
+
 async def handle_delivery_proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global photo handler — only acts if the sender is a rider currently submitting delivery proof."""
     rider_id = update.effective_user.id
@@ -1331,6 +1433,47 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def referralboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ws = get_referrals_sheet()
+    if ws is None:
+        await update.message.reply_text("🎁 Referral leaderboard isn't set up yet — check back soon!")
+        return
+
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        logger.exception("Failed to read Referrals worksheet for leaderboard")
+        await update.message.reply_text("Couldn't load the referral leaderboard right now, try again shortly.")
+        return
+
+    def _count(r):
+        try:
+            return int(r.get("Total Referred", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    referrers = [r for r in records if _count(r) > 0]
+    if not referrers:
+        await update.message.reply_text(
+            "🎁 No referrals yet — be the first! Run /myreferral to get your code."
+        )
+        return
+
+    sorted_referrers = sorted(referrers, key=_count, reverse=True)
+    top = sorted_referrers[:10]
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🎁 *BikeBlitz Referral Leaderboard*\n"]
+    for i, r in enumerate(top):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        name = r.get("Name", "Unknown")
+        count = _count(r)
+        lines.append(f"{prefix} {name} — {count} referral{'s' if count != 1 else ''}")
+
+    lines.append("\nRun /myreferral to get your own code and start climbing! 🚀")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 def record_rider_zone(rider_id, rider_name, zone_name):
     """Set a rider's home zone in column H, creating the row/column if needed."""
     try:
@@ -1413,14 +1556,18 @@ async def myearnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     completed = stats.get("Completed Deliveries", 0) or 0
-    earnings = stats.get("Total Earnings", 0) or 0
+    earnings = int(stats.get("Total Earnings", 0) or 0)
     claimed = stats.get("Deliveries Claimed", 0) or 0
+    paid_out = int(stats.get("Paid Out", 0) or 0)
+    pending = max(0, earnings - paid_out)
 
     await update.message.reply_text(
         f"💰 *Your BikeBlitz Earnings*\n\n"
         f"📦 Deliveries claimed: {claimed}\n"
         f"✅ Deliveries completed: {completed}\n"
-        f"💳 Total earned: ₦{int(earnings):,}",
+        f"💳 Total earned: ₦{earnings:,}\n"
+        f"✅ Paid out so far: ₦{paid_out:,}\n"
+        f"⏳ Pending payout: ₦{pending:,}",
         parse_mode="Markdown"
     )
 
@@ -1993,6 +2140,48 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That ID wasn't on the blocklist.")
 
 
+async def payout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/payout TELEGRAM_ID AMOUNT`\n\n"
+            "Records that you paid a rider cash/transfer for their earnings.",
+            parse_mode="Markdown"
+        )
+        return
+
+    rider_id, amount_str = context.args[0], context.args[1]
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        await update.message.reply_text("AMOUNT must be a number.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("AMOUNT must be greater than 0.")
+        return
+
+    success = add_rider_payout(rider_id, amount)
+    if not success:
+        await update.message.reply_text("Couldn't find that rider in the Riders sheet.")
+        return
+
+    new_paid_out = get_rider_paid_out(rider_id)
+    await update.message.reply_text(
+        f"✅ Recorded ₦{amount:,} payout to {rider_id}.\n"
+        f"Total paid out so far: ₦{new_paid_out:,}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=int(rider_id),
+            text=f"💸 You've been paid ₦{amount:,} by BikeBlitz. Check `/myearnings` for your updated balance.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Could not notify rider of payout")
+
+
 async def riderrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # admin-only, silently ignore otherwise
@@ -2011,11 +2200,15 @@ async def riderrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     flag = "🚩 Below threshold" if stats["average"] < LOW_RATING_THRESHOLD else "✅ Healthy"
+    reassignments = get_rider_reassignment_count(rider_id)
+    reliability_flag = "🚩 Unreliable" if reassignments >= RELIABILITY_MAX_REASSIGNMENTS else "✅ Healthy"
     await update.message.reply_text(
         f"⭐ *Rider Rating*\n\n"
         f"🆔 {rider_id}\n"
         f"Average: {stats['average']:.1f} over {stats['count']} ratings\n"
-        f"Status: {flag}",
+        f"Rating status: {flag}\n\n"
+        f"🔄 Reassignments/no-shows: {reassignments}\n"
+        f"Reliability status: {reliability_flag}",
         parse_mode="Markdown"
     )
 
@@ -2069,10 +2262,12 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Riders*\n"
         "`/whosonline` — riders currently online\n"
         "`/leaderboard` — top riders by deliveries\n"
-        "`/riderrating TELEGRAM_ID` — check a rider's average rating\n"
+        "`/riderrating TELEGRAM_ID` — check a rider's average rating & reliability\n"
+        "`/payout TELEGRAM_ID AMOUNT` — record a cash/transfer payout to a rider\n"
         "New `/apply` submissions arrive automatically with Approve/Reject buttons — nothing to run manually.\n"
         f"You'll also get an automatic 🚩 alert if a rider's average drops below {LOW_RATING_THRESHOLD} "
-        f"(after at least {LOW_RATING_MIN_RATINGS} ratings).\n\n"
+        f"(after at least {LOW_RATING_MIN_RATINGS} ratings), or if a rider is reassigned/no-shows "
+        f"{RELIABILITY_MAX_REASSIGNMENTS}+ times.\n\n"
         "*Wallet*\n"
         "Customer `/topup` requests arrive automatically with Approve/Reject buttons — nothing to run manually.\n\n"
         "*Setup*\n"
@@ -3245,7 +3440,9 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
     detail_text += (
         f"💳 Total: ₦{order.get('total', 0):,}\n"
         f"👤 Customer: {order.get('customer_name')} ({customer_contact})\n\n"
-        "Please reach out to the customer to confirm pickup/drop-off. Ride safe! 🚴"
+        "Please reach out to the customer to confirm pickup/drop-off. Ride safe! 🚴\n\n"
+        "📍 _Tip: share your live location in this chat (📎 → Location → Share Live Location) "
+        "so the customer can track you on the way!_"
     )
 
     delivered_keyboard = InlineKeyboardMarkup([
@@ -3263,7 +3460,10 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await context.bot.send_message(
             chat_id=order.get("customer_id"),
-            text=f"🚴 Your rider *{rider.full_name}* has been assigned and will reach out shortly!",
+            text=(
+                f"🚴 Your rider *{rider.full_name}* has been assigned and will reach out shortly!\n\n"
+                "If they share their live location, you'll see it appear right here in this chat."
+            ),
             parse_mode="Markdown",
         )
     except Exception:
@@ -3421,6 +3621,27 @@ async def reassign_claimed_order(update: Update, context: ContextTypes.DEFAULT_T
     order["rider_id"] = None
     order["rider_name"] = None
     order["reassigned_count"] = order.get("reassigned_count", 0) + 1
+
+    reassignment_total = record_rider_reassignment(old_rider_id)
+    if reassignment_total >= RELIABILITY_MAX_REASSIGNMENTS:
+        unreliable_flagged = context.application.bot_data.setdefault("flagged_unreliable_riders", set())
+        old_rider_id_str = str(old_rider_id)
+        if old_rider_id_str not in unreliable_flagged:
+            unreliable_flagged.add(old_rider_id_str)
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"🚩 *Rider Reliability Alert*\n\n"
+                        f"👤 Rider: {old_rider_name}\n"
+                        f"🆔 {old_rider_id}\n"
+                        f"🔄 Reassigned/no-show count: {reassignment_total}\n\n"
+                        "You may want to check in with this rider."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception("Failed to send rider reliability alert")
 
     try:
         await context.bot.send_message(
@@ -3604,6 +3825,7 @@ def main():
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("groupid", groupid))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("referralboard", referralboard))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("myorders", myorders))
     app.add_handler(CommandHandler("stats", stats))
@@ -3618,6 +3840,7 @@ def main():
     app.add_handler(CommandHandler("createpromo", createpromo))
     app.add_handler(CommandHandler("wallet", wallet))
     app.add_handler(CommandHandler("riderrating", riderrating))
+    app.add_handler(CommandHandler("payout", payout_cmd))
     app.add_handler(CommandHandler("block", block_cmd))
     app.add_handler(CommandHandler("unblock", unblock_cmd))
     app.add_handler(CommandHandler("export", export_transactions))
@@ -3626,6 +3849,7 @@ def main():
     # Global handler (separate group) — catches delivery proof photos from riders
     # regardless of what conversation state the customer-facing flow is in.
     app.add_handler(MessageHandler(filters.PHOTO, handle_delivery_proof_photo), group=1)
+    app.add_handler(MessageHandler(filters.LOCATION, handle_rider_location), group=1)
 
     # Weekly recap — Sunday 9 PM WAT (20:00 UTC, since WAT is UTC+1)
     if app.job_queue is not None:
