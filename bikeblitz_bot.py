@@ -214,6 +214,36 @@ async def send_cutoff_reminder(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Failed to send cutoff reminder")
 
 
+async def check_idle_riders(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job — auto-marks riders offline if they've been online too long without
+    toggling, so /whosonline stays accurate. Runs off in-memory state, so this resets on
+    a redeploy (riders will simply need to /online again after a restart, as usual)."""
+    online_since = context.application.bot_data.get("rider_online_since", {})
+    if not online_since:
+        return
+
+    now = datetime.now()
+    stale_ids = [
+        rid for rid, info in online_since.items()
+        if (now - info["since"]).total_seconds() > IDLE_ONLINE_HOURS * 3600
+    ]
+    for rid in stale_ids:
+        info = online_since.pop(rid)
+        record_rider_status(int(rid), info.get("name", "Unknown"), "Offline")
+        try:
+            await context.bot.send_message(
+                chat_id=int(rid),
+                text=(
+                    f"🔴 You've been auto-marked *Offline* after being online for "
+                    f"{IDLE_ONLINE_HOURS}+ hours without a delivery.\n\n"
+                    "Run /online whenever you're back and ready for orders!"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception(f"Could not notify rider {rid} of auto-offline")
+
+
 async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
     """Scheduled job — posts a weekly recap to the admin every Sunday night."""
     data = get_week_stats()
@@ -395,6 +425,7 @@ logger = logging.getLogger(__name__)
 
 (AWAITING_TOPUP_PROOF,) = range(18, 19)
 (ADD_MORE_PACKAGES,) = range(19, 20)
+(CHOOSING_SPLIT_INFO,) = range(20, 21)
 
 # Pricing
 ZONE_PRICES = {
@@ -423,6 +454,7 @@ LOW_RATING_MIN_RATINGS = 3  # don't flag until a rider has at least this many ra
 
 # --- Rider reliability monitoring ---
 RELIABILITY_MAX_REASSIGNMENTS = 2  # alert admin once a rider hits this many reassignments/no-shows
+IDLE_ONLINE_HOURS = 6  # auto-mark a rider offline after being online this long with no toggle
 
 # --- Loyalty program ---
 LOYALTY_FREE_EVERY = 10  # every Nth completed order is free (0 disables the program)
@@ -1511,12 +1543,16 @@ def get_riders_by_zone(zone_name):
 async def online(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     record_rider_status(user.id, user.full_name, "Online")
+    online_since = context.application.bot_data.setdefault("rider_online_since", {})
+    online_since[str(user.id)] = {"since": datetime.now(), "name": user.full_name}
     await update.message.reply_text("🟢 You're marked as *Online* — you'll be visible for new orders!", parse_mode="Markdown")
 
 
 async def offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     record_rider_status(user.id, user.full_name, "Offline")
+    online_since = context.application.bot_data.get("rider_online_since", {})
+    online_since.pop(str(user.id), None)
     await update.message.reply_text("🔴 You're marked as *Offline*. Use /online when you're back!", parse_mode="Markdown")
 
 
@@ -2140,6 +2176,51 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That ID wasn't on the blocklist.")
 
 
+async def findorder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return  # admin-only, silently ignore otherwise
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/findorder QUERY` — search by customer name or Telegram ID.",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(context.args).strip().lower()
+    sheet = get_sheet()
+    if sheet is None:
+        await update.message.reply_text("Google Sheets isn't configured yet.")
+        return
+
+    try:
+        records = sheet.get_all_records()
+    except Exception:
+        logger.exception("Failed to search transactions")
+        await update.message.reply_text("Couldn't search right now — try again shortly.")
+        return
+
+    matches = [
+        r for r in records
+        if query in str(r.get("Customer Name", "")).lower() or query == str(r.get("Telegram ID", "")).lower()
+    ]
+
+    if not matches:
+        await update.message.reply_text(f"No orders found matching \"{query}\".")
+        return
+
+    recent = list(reversed(matches))[:10]
+    lines = [f"🔍 *Found {len(matches)} order(s)* (showing up to 10 most recent)\n"]
+    for r in recent:
+        status_emoji = "✅" if r.get("Status") == "Delivered" else "🚴" if r.get("Status") == "Pending" else "❌" if r.get("Status") == "Cancelled" else "❔"
+        lines.append(
+            f"{status_emoji} {r.get('Timestamp', 'N/A')} — {r.get('Customer Name', 'N/A')} "
+            f"({r.get('Telegram ID', 'N/A')})\n"
+            f"    {r.get('Zone', 'N/A')} — ₦{r.get('Total', 0):,} ({r.get('Status', 'Unknown')})"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def payout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return  # admin-only, silently ignore otherwise
@@ -2256,6 +2337,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠️ *Admin Commands*\n\n"
         "*Orders & Money*\n"
         "`/stats` — today's & all-time orders/revenue\n"
+        "`/findorder QUERY` — search orders by customer name or Telegram ID\n"
         "`/export` — download full transactions as CSV\n"
         "`/broadcast msg` — message every past customer\n"
         "`/createpromo CODE TYPE VALUE MAXUSES [EXPIRY]` — create a promo code\n\n"
@@ -2600,8 +2682,27 @@ async def handle_errand_items(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(
         f"📝 Got it: *{text.strip()}*\n\n"
-        "Now select your delivery zone 👇",
+        "Is anyone splitting this order with you — e.g. roommates chipping in? "
+        "If so, who? Otherwise tap Skip. 👇",
         parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([
+            [KeyboardButton("⏭️ Skip")],
+            [KeyboardButton("🏠 Main Menu")],
+        ], resize_keyboard=True)
+    )
+    return CHOOSING_SPLIT_INFO
+
+
+async def handle_split_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🏠 Main Menu":
+        return await start(update, context)
+
+    if text != "⏭️ Skip":
+        context.user_data["split_with"] = text.strip()
+
+    await update.message.reply_text(
+        "Now select your delivery zone 👇",
         reply_markup=zone_keyboard()
     )
     return CHOOSING_ZONE
@@ -2754,6 +2855,11 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
             f"📋 *Order Summary*\n\n"
             f"🛒 Service: {errand_type}\n"
             f"📝 Items: {errand_items}\n"
+        )
+        split_with = context.user_data.get("split_with")
+        if split_with:
+            breakdown += f"🤝 Splitting with: {split_with}\n"
+        breakdown += (
             f"🗺️ Zone: {zone}\n"
             f"📍 Location: {location_details}\n"
             f"🚴 Delivery Type: {delivery_type}\n"
@@ -2927,7 +3033,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await dispatch_confirmed_order(
             context, str(user.id), user.id, user.full_name, user.username,
             service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
-            scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None
+            scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None,
+            split_with=context.user_data.get("split_with", "")
         )
 
         new_balance = get_wallet_balance(user_id)
@@ -2985,7 +3092,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dispatch_confirmed_order(
                 context, str(user.id), user.id, user.full_name, user.username,
                 service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
-                scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None
+                scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None,
+                split_with=context.user_data.get("split_with", "")
             )
 
             confirmation = (
@@ -3081,6 +3189,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     if errand_items:
         summary += f"📝 Items: {errand_items}\n"
+    if context.user_data.get("split_with"):
+        summary += f"🤝 Splitting with: {context.user_data.get('split_with')}\n"
     summary += (
         f"🗺️ Zone: {zone}\n"
         f"📍 Exact location: {location_details}\n"
@@ -3111,6 +3221,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         "zone": zone,
         "location": location_details,
         "errand_items": context.user_data.get("errand_items", ""),
+        "split_with": context.user_data.get("split_with", ""),
     }
 
     approval_keyboard = InlineKeyboardMarkup([
@@ -3163,6 +3274,8 @@ async def broadcast_order_to_riders(context, customer_id_str):
     )
     if errand_items:
         order_text += f"📝 Items: {errand_items}\n"
+    if order.get("split_with"):
+        order_text += f"🤝 Splitting with: {order.get('split_with')}\n"
     order_text += (
         f"🗺️ Zone: {zone}\n"
         f"📍 Location: {location}\n"
@@ -3217,7 +3330,7 @@ async def scheduled_broadcast_job(context: ContextTypes.DEFAULT_TYPE):
 async def dispatch_confirmed_order(
     context, customer_id_str, customer_id, customer_name, customer_username,
     service, zone, location, errand_items, delivery_type, scheduled_time, total,
-    scheduled_dt=None
+    scheduled_dt=None, split_with=""
 ):
     """Logs a fully-paid order and either broadcasts it to the rider group immediately,
     or — for scheduled deliveries far enough out — queues the broadcast for closer to
@@ -3241,6 +3354,7 @@ async def dispatch_confirmed_order(
         "zone": zone,
         "location": location,
         "errand_items": errand_items,
+        "split_with": split_with,
         "delivery_type": delivery_type,
         "scheduled_time": scheduled_time,
         "total": total,
@@ -3285,6 +3399,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         zone = order.get("zone", "N/A") if order else "N/A"
         location = order.get("location", "N/A") if order else "N/A"
         errand_items = order.get("errand_items", "") if order else ""
+        split_with = order.get("split_with", "") if order else ""
 
         scheduled_dt = None
         if scheduled_datetime_str:
@@ -3321,7 +3436,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         await dispatch_confirmed_order(
             context, customer_id_str, customer_id, customer_name, customer_username,
             service, zone, location, errand_items, delivery_type, scheduled_time, total,
-            scheduled_dt=scheduled_dt
+            scheduled_dt=scheduled_dt, split_with=split_with
         )
     else:
         await context.bot.send_message(
@@ -3430,6 +3545,8 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     if order.get("errand_items"):
         detail_text += f"📝 Items: {order.get('errand_items')}\n"
+    if order.get("split_with"):
+        detail_text += f"🤝 Splitting with: {order.get('split_with')}\n"
     detail_text += (
         f"🗺️ Zone: {order.get('zone')}\n"
         f"📍 Location: {order.get('location')}\n"
@@ -3455,6 +3572,22 @@ async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception:
         logger.exception("Could not DM rider — they may not have started the bot yet")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"⚠️ *Couldn't reach rider by DM*\n\n"
+                    f"👤 {rider.full_name} claimed an order but hasn't started the bot yet, "
+                    f"so the delivery details couldn't be sent.\n\n"
+                    f"🆔 {rider.id}\n"
+                    f"🗺️ {order.get('zone')} — {order.get('location')}\n"
+                    f"💳 ₦{order.get('total', 0):,}\n\n"
+                    "You may want to call them directly."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Also failed to notify admin of rider DM failure")
 
     # Let the customer know a rider has been assigned
     try:
@@ -3770,6 +3903,7 @@ def main():
             CHOOSING_LOCATION_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_details)],
             AWAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message)],
             AWAITING_ERRAND_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand_items)],
+            CHOOSING_SPLIT_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_split_info)],
             CHOOSING_ERRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_errand)],
             CONFIRMING_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
             AWAITING_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_promo_code)],
@@ -3844,6 +3978,7 @@ def main():
     app.add_handler(CommandHandler("block", block_cmd))
     app.add_handler(CommandHandler("unblock", unblock_cmd))
     app.add_handler(CommandHandler("export", export_transactions))
+    app.add_handler(CommandHandler("findorder", findorder))
     app.add_handler(CommandHandler("admin", admin_help))
 
     # Global handler (separate group) — catches delivery proof photos from riders
@@ -3870,6 +4005,13 @@ def main():
             send_win_back_nudges,
             time=dt_time(hour=10, minute=0),
             name="win_back_nudges",
+        )
+        # Idle-rider auto-offline check — every 30 minutes
+        app.job_queue.run_repeating(
+            check_idle_riders,
+            interval=timedelta(minutes=30),
+            first=timedelta(minutes=5),
+            name="check_idle_riders",
         )
 
     # --- Webhook setup for Render ---
