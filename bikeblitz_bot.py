@@ -604,6 +604,72 @@ def deduct_credit(user_id, amount):
         logger.exception("Failed to deduct credit")
 
 
+# ---------- Web order helpers (shared mailbox with the ordering website) ----------
+# The bot and the website run as separate processes, so a Google Sheets tab is used
+# as the shared coordination point for web-placed orders instead of in-memory state.
+
+def get_weborders_sheet():
+    """Returns the 'WebOrders' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("WebOrders")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="WebOrders", rows=1000, cols=14)
+            ws.append_row([
+                "Reference", "Customer Name", "Phone", "Service", "Zone", "Location",
+                "Errand Items", "Delivery Type", "Total", "Status", "Rider ID",
+                "Rider Name", "Broadcast Message ID", "Timestamp"
+            ])
+            return ws
+    except Exception:
+        logger.exception("Failed to access WebOrders worksheet")
+        return None
+
+
+def get_web_order(reference):
+    """Fetch a web order row (and its row number) by its Paystack reference."""
+    try:
+        ws = get_weborders_sheet()
+        if ws is None:
+            return None, None
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        for idx, row in enumerate(rows[1:], start=2):
+            if row and row[0] == reference:
+                record = dict(zip(headers, row))
+                return idx, record
+        return None, None
+    except Exception:
+        logger.exception("Failed to fetch web order")
+        return None, None
+
+
+def update_web_order(reference, **fields):
+    """Updates specific columns of a web order row by header name."""
+    try:
+        ws = get_weborders_sheet()
+        if ws is None:
+            return False
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        for idx, row in enumerate(rows[1:], start=2):
+            if row and row[0] == reference:
+                for key, value in fields.items():
+                    if key in headers:
+                        col_idx = headers.index(key) + 1
+                        col_letter = chr(ord("A") + col_idx - 1)
+                        ws.update(f"{col_letter}{idx}", [[value]])
+                return True
+        return False
+    except Exception:
+        logger.exception("Failed to update web order")
+        return False
+
+
 # ---------- Promo code helpers ----------
 
 def get_promo_sheet():
@@ -3504,6 +3570,101 @@ async def check_unclaimed_order(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Failed to alert admin of unclaimed order")
 
 
+async def handle_web_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Claim handler for orders placed on the website (sheet-backed, not memory-backed)."""
+    query = update.callback_query
+    _, reference = query.data.split(":", 1)
+
+    row, order = get_web_order(reference)
+    if order is None:
+        await query.answer("This order no longer exists.", show_alert=True)
+        return
+    if order.get("Rider ID"):
+        await query.answer(f"Already claimed by {order.get('Rider Name')}.", show_alert=True)
+        return
+    if is_blocked(query.from_user.id):
+        await query.answer("Your account has been restricted. Contact the admin.", show_alert=True)
+        return
+
+    rider = query.from_user
+    update_web_order(reference, **{"Rider ID": str(rider.id), "Rider Name": rider.full_name, "Status": "Claimed"})
+    record_rider_delivery(rider.id, rider.full_name)
+
+    await query.answer("You've got this delivery! Check your DM for details.")
+    await query.edit_message_text(
+        (query.message.text or "") + f"\n\n✅ *Claimed by {rider.full_name}*",
+        parse_mode="Markdown",
+    )
+
+    detail_text = (
+        "📦 *Web Order — Delivery Details*\n\n"
+        f"🛠️ Service: {order.get('Service')}\n"
+    )
+    if order.get("Errand Items"):
+        detail_text += f"📝 Items: {order.get('Errand Items')}\n"
+    detail_text += (
+        f"🗺️ Zone: {order.get('Zone')}\n"
+        f"📍 Location: {order.get('Location')}\n"
+        f"🚴 Delivery Type: {order.get('Delivery Type')}\n"
+        f"💳 Total: ₦{int(order.get('Total', 0) or 0):,}\n"
+        f"👤 Customer: {order.get('Customer Name')} ({order.get('Phone', 'no phone on file')})\n\n"
+        "This customer ordered on the website and paid by card/transfer — no payment collection needed. "
+        "Please reach out to confirm pickup/drop-off. Ride safe! 🚴"
+    )
+    delivered_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Mark as Delivered", callback_data=f"webdelivered:{reference}")]
+    ])
+    try:
+        await context.bot.send_message(chat_id=rider.id, text=detail_text, parse_mode="Markdown", reply_markup=delivered_keyboard)
+    except Exception:
+        logger.exception("Could not DM rider for web order")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"⚠️ *Couldn't reach rider by DM (web order)*\n\n"
+                    f"👤 {rider.full_name} — 🆔 {rider.id}\n"
+                    f"Order {reference} — {order.get('Zone')} — ₦{order.get('Total')}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Also failed to notify admin of web-order DM failure")
+
+
+async def handle_web_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Marks a web order delivered. No photo-proof step in v1 — simpler by design."""
+    query = update.callback_query
+    _, reference = query.data.split(":", 1)
+
+    row, order = get_web_order(reference)
+    if order is None:
+        await query.answer("This order's details are no longer available.", show_alert=True)
+        return
+    if str(order.get("Rider ID")) != str(query.from_user.id):
+        await query.answer("Only the rider who claimed this can mark it delivered.", show_alert=True)
+        return
+    if order.get("Status") == "Delivered":
+        await query.answer("Already marked as delivered.")
+        return
+
+    update_web_order(reference, Status="Delivered")
+    record_rider_completion(query.from_user.id, int(order.get("Total", 0) or 0))
+
+    await query.answer("Delivery marked complete!")
+    await query.edit_message_text(
+        (query.message.text or "") + "\n\n✅ *DELIVERED*",
+        parse_mode="Markdown",
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"📦 Web order {reference} delivered by {order.get('Rider Name')}.",
+        )
+    except Exception:
+        logger.exception("Could not notify admin of web order delivery")
+
+
 async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -3949,6 +4110,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_topup_decision, pattern=r"^(topupapprove|topupreject):"))
     app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_rider_claim, pattern=r"^claim:"))
+    app.add_handler(CallbackQueryHandler(handle_web_claim, pattern=r"^webclaim:"))
+    app.add_handler(CallbackQueryHandler(handle_web_delivered, pattern=r"^webdelivered:"))
     app.add_handler(CallbackQueryHandler(handle_delivered, pattern=r"^delivered:"))
     app.add_handler(CallbackQueryHandler(handle_cancel_order, pattern=r"^cancelorder:"))
     app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^rate:"))
