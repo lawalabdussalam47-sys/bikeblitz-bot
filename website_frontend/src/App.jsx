@@ -6,11 +6,12 @@ const API_BASE = "https://bikeblitz-website.onrender.com";
 
 // ---------- Pricing data (mirrors bikeblitz_bot.py exactly) ----------
 const ZONES = [
-  { id: "z1", name: "Zone 1 — On Campus", desc: "Anywhere within FUNAAB campus", prices: { Light: 300, Medium: 500, Heavy: 700 } },
-  { id: "z2", name: "Zone 2 — Near Off Campus", desc: "Harmony, Accord, Zoo, Agbede, Kofesu", prices: { Light: 500, Medium: 700, Heavy: 900 } },
-  { id: "z3", name: "Zone 3 — Mid Off Campus", desc: "Labuta, Isolu-Cele, Isolu-FUNIS, Camp", prices: { Light: 700, Medium: 900, Heavy: 1100 } },
-  { id: "z4", name: "Zone 4 — Far Off Campus", desc: "Town", prices: { Light: 1200, Medium: 1400, Heavy: 1600 } },
+  { id: "z1", name: "Zone 1 - On Campus", desc: "Anywhere within FUNAAB campus", prices: { Light: 300, Medium: 500, Heavy: 700 } },
+  { id: "z2", name: "Zone 2 - Near Off Campus", desc: "Harmony, Accord, Zoo, Agbede, Kofesu", prices: { Light: 500, Medium: 700, Heavy: 900 } },
+  { id: "z3", name: "Zone 3 - Mid Off Campus", desc: "Labuta, Isolu-Cele, Isolu-FUNIS, Camp", prices: { Light: 700, Medium: 900, Heavy: 1100 } },
+  { id: "z4", name: "Zone 4 - Far Off Campus", desc: "Town", prices: { Light: 1200, Medium: 1400, Heavy: 1600 } },
 ];
+
 const ERRAND_FEES = { "Simple Errand / Food Order": 100, "Complex Errand / Bulk Shopping": 250 };
 const EXPRESS_SURCHARGE = 300;
 const DISTANCE_MODIFIER = 200;
