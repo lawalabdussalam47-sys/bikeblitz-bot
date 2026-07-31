@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from "react";
-import logo from "./assets/logo.png";
+import logo from "./assets/IMG_7232.png";
 
 // Live backend URL — update this if you ever redeploy the backend elsewhere.
 const API_BASE = "https://bikeblitz-website.onrender.com";
