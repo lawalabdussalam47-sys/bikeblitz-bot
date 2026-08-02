@@ -45,6 +45,20 @@ def get_transactions_sheet():
     return ss.sheet1 if ss else None
 
 
+def get_online_rider_count():
+    """Counts riders currently marked Online in the Riders sheet (same sheet the bot writes to)."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return 0
+    try:
+        ws = ss.worksheet("Riders")
+        records = ws.get_all_records()
+        return sum(1 for r in records if r.get("Availability") == "Online")
+    except Exception:
+        logger.exception("Failed to count online riders")
+        return 0
+
+
 def get_weborders_sheet():
     ss = get_spreadsheet()
     if ss is None:
