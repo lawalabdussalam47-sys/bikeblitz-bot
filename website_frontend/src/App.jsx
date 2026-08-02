@@ -11,7 +11,6 @@ const ZONES = [
   { id: "z3", name: "Zone 3 - Mid Off Campus", desc: "Labuta, Isolu-Cele, Isolu-FUNIS, Camp", prices: { Light: 700, Medium: 900, Heavy: 1100 } },
   { id: "z4", name: "Zone 4 - Far Off Campus", desc: "Town", prices: { Light: 1200, Medium: 1400, Heavy: 1600 } },
 ];
-
 const ERRAND_FEES = { "Simple Errand / Food Order": 100, "Complex Errand / Bulk Shopping": 250 };
 const EXPRESS_SURCHARGE = 300;
 const DISTANCE_MODIFIER = 200;
@@ -140,6 +139,22 @@ function OrderFlow() {
   const [paying, setPaying] = useState(false);
   const [paid, setPaid] = useState(false);
   const [checkoutError, setCheckoutError] = useState("");
+  const [onlineRiders, setOnlineRiders] = useState(null); // null = not loaded yet
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/riders/status`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled) setOnlineRiders(data.onlineCount ?? 0);
+      })
+      .catch(() => {
+        if (!cancelled) setOnlineRiders(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const zone = ZONES.find((z) => z.id === zoneId);
 
@@ -199,11 +214,7 @@ function OrderFlow() {
       <header className="border-b border-neutral-800 bg-neutral-900/95 backdrop-blur">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-5 py-4">
           <div className="flex items-center gap-2">
-            <img
-              src={logo}
-              alt="BikeBlitz"
-              className="h-9 w-9 rounded-lg"
-            />
+            <img src={logo} alt="BikeBlitz" className="h-9 w-9 rounded-lg" />
             <span className="text-lg font-black tracking-tight">BikeBlitz</span>
           </div>
           <div className="hidden items-center gap-6 text-sm text-neutral-400 sm:flex">
@@ -222,8 +233,20 @@ function OrderFlow() {
           style={{ background: "#8A3820" }}
         />
         <div className="mx-auto max-w-5xl">
-          <div className="mb-3 inline-block rounded-full border px-3 py-1 font-mono text-xs" style={{ borderColor: "#8A3820", color: "#c9724f" }}>
-            Same-day · 9am–9pm · cutoff 8pm
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="inline-block rounded-full border px-3 py-1 font-mono text-xs" style={{ borderColor: "#8A3820", color: "#c9724f" }}>
+              Same-day · 9am–9pm · cutoff 8pm
+            </div>
+            {onlineRiders !== null && (
+              <div
+                className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 font-mono text-xs ${
+                  onlineRiders > 0 ? "border-lime-400/50 text-lime-300" : "border-neutral-600 text-neutral-400"
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${onlineRiders > 0 ? "bg-lime-400" : "bg-neutral-500"}`} />
+                {onlineRiders > 0 ? `${onlineRiders} rider${onlineRiders !== 1 ? "s" : ""} online now` : "No riders online right now"}
+              </div>
+            )}
           </div>
           <h1 className="max-w-2xl text-4xl font-black leading-[1.05] tracking-tight sm:text-6xl">
             Fast. Reliable.
@@ -442,6 +465,12 @@ function OrderFlow() {
               <p className="mt-1 text-sm text-neutral-500">
                 You'll be redirected to Paystack's secure checkout to complete payment.
               </p>
+              {onlineRiders === 0 && (
+                <div className="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+                  ⚠️ No riders are online right now. Your order will still go through and be broadcast
+                  the moment payment confirms, but it may take longer than usual to be claimed.
+                </div>
+              )}
               {checkoutError && (
                 <div className="mt-4 rounded-lg border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-300">
                   {checkoutError}
@@ -476,7 +505,6 @@ function OrderFlow() {
                         setPaying(false);
                         return;
                       }
-                      // Send the customer to Paystack's real checkout page
                       window.location.href = data.authorizationUrl;
                     } catch (err) {
                       setCheckoutError("Couldn't reach the server. Check your connection and try again.");
