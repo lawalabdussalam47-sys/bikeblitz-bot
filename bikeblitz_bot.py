@@ -2455,8 +2455,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FUNAAB's fastest campus delivery and errand service.\n\n"
         )
 
+    online_count = len(get_online_riders())
+    if online_count > 0:
+        rider_notice = f"🟢 {online_count} rider{'s' if online_count != 1 else ''} online right now\n\n"
+    else:
+        rider_notice = "⚠️ No riders online right now — your order will still be accepted, but may take longer to be claimed.\n\n"
+
     await update.message.reply_text(
         greeting +
+        rider_notice +
         "🕒 *Operating Hours:* Daily 9am – 9pm\n"
         "🌙 *Same-day cut-off:* 8pm\n\n"
         "Fast. Reliable. Zero silence. Every order.\n\n"
@@ -2986,6 +2993,14 @@ async def handle_location_details(update: Update, context: ContextTypes.DEFAULT_
     if delivery_type == "Scheduled":
         scheduled_time = context.user_data.get("scheduled_time", "")
         breakdown += f"\n📅 Scheduled for: *{scheduled_time}*"
+    else:
+        online_count = len(get_online_riders())
+        if online_count == 0:
+            breakdown += (
+                "\n\n⚠️ No riders are online right now. Your order will still be accepted "
+                "and broadcast the moment payment is confirmed, but it may take longer than "
+                "usual to be claimed."
+            )
 
     if context.user_data.get("loyalty_free"):
         reply_markup = ReplyKeyboardMarkup([
