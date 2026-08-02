@@ -24,6 +24,12 @@ def health():
     return jsonify({"ok": True})
 
 
+@app.route("/api/riders/status")
+def riders_status():
+    count = sheets.get_online_rider_count()
+    return jsonify({"onlineCount": count})
+
+
 @app.route("/api/quote", methods=["POST"])
 def quote():
     body = request.get_json(force=True) or {}
@@ -102,7 +108,7 @@ def paystack_webhook():
 
     event = request.get_json(force=True) or {}
     if event.get("event") != "charge.success":
-        return "", 200  # acknowledge, nothing to do for other event types
+        return "", 200
 
     reference = event.get("data", {}).get("reference")
     if not reference:
@@ -119,7 +125,7 @@ def paystack_webhook():
         return "", 200
 
     if order.get("Status") not in ("Pending Payment", ""):
-        return "", 200  # already processed — webhooks can be sent more than once
+        return "", 200
 
     total = int(order.get("Total", 0) or 0)
     if amount_kobo != total * 100:
