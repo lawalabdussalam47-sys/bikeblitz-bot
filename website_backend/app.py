@@ -178,3 +178,31 @@ def order_status(reference):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10001"))
     app.run(host="0.0.0.0", port=port)
+@app.route("/api/orders/<reference>/deliver", methods=["POST"])
+def confirm_delivery(reference):
+    order = sheets.get_web_order(reference)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+
+    if order.get("Status") == "Delivered":
+        return jsonify({"error": "This order has already been marked as delivered."}), 400
+
+    photo = request.files.get("photo")
+    if not photo or not photo.filename:
+        return jsonify({"error": "A delivery photo is required."}), 400
+
+    photo_bytes = photo.read()
+    if len(photo_bytes) == 0:
+        return jsonify({"error": "The uploaded photo appears to be empty."}), 400
+
+    sheets.update_web_order(reference, Status="Delivered")
+
+    telegram_notify.send_delivery_proof(
+        reference=reference,
+        photo_bytes=photo_bytes,
+        filename=photo.filename,
+        zone=order.get("Zone"),
+        location=order.get("Location"),
+    )
+
+    return jsonify({"reference": reference, "status": "Delivered"})
