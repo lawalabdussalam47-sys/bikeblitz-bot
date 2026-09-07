@@ -1,0 +1,21 @@
+{
+  "name": "BikeBlitz",
+  "short_name": "BikeBlitz",
+  "description": "Campus delivery and errands at FUNAAB",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1F3B2C",
+  "icons": [
+    {
+      "src": "/icon-192.png.PNG",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png%20.PNG",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
