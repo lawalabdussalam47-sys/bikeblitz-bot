@@ -61,3 +61,31 @@ def notify_admin(text):
     if not ADMIN_CHAT_ID:
         return
     _post("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+def send_delivery_proof(reference, photo_bytes, filename, zone, location):
+    if not API_BASE:
+        logger.warning("BOT_TOKEN not configured — skipping delivery proof notification")
+        return None
+    caption = (
+        "📦 *Delivery Proof Submitted*\n\n"
+        f"Reference: `{reference}`\n"
+        f"🗺️ Zone: {zone}\n"
+        f"📍 Location: {location}\n\n"
+        "Customer confirmed delivery via website."
+    )
+    try:
+        resp = requests.post(
+            f"{API_BASE}/sendPhoto",
+            data={
+                "chat_id": RIDER_GROUP_CHAT_ID,
+                "caption": caption,
+                "parse_mode": "Markdown",
+            },
+            files={"photo": (filename, photo_bytes)},
+            timeout=15,
+        )
+        if not resp.ok:
+            logger.error(f"Telegram sendPhoto error: {resp.text}")
+        return resp.json()
+    except Exception:
+        logger.exception("Failed to send delivery proof photo to Telegram")
+        return None
