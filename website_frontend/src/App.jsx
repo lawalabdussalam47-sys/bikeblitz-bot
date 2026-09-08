@@ -43,6 +43,11 @@ function RouteDot({ active, done, label, index }) {
 function TrackOrder({ reference }) {
   const [order, setOrder] = useState(null);
   const [error, setError] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [deliverError, setDeliverError] = useState("");
+  const [justDelivered, setJustDelivered] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +75,47 @@ function TrackOrder({ reference }) {
 
   const statusSteps = ["Pending Payment", "Paid", "Claimed", "Delivered"];
   const currentIndex = order ? statusSteps.indexOf(order.status) : -1;
+
+  const handlePhotoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhoto(file);
+    setDeliverError("");
+    const reader = new FileReader();
+    reader.onload = () => setPhotoPreview(reader.result);
+    reader.readAsDataURL(file);
+  };
+
+  const submitDelivery = async () => {
+    if (!photo) {
+      setDeliverError("Please attach a photo showing the delivered item.");
+      return;
+    }
+    setSubmitting(true);
+    setDeliverError("");
+    try {
+      const formData = new FormData();
+      formData.append("photo", photo);
+      const res = await fetch(`${API_BASE}/api/orders/${reference}/deliver`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setDeliverError(data.error || "Couldn't confirm delivery — try again.");
+        setSubmitting(false);
+        return;
+      }
+      setJustDelivered(true);
+      setOrder((prev) => ({ ...prev, status: "Delivered" }));
+    } catch (err) {
+      setDeliverError("Couldn't reach the server. Check your connection and try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const canConfirmDelivery = order && order.status !== "Delivered" && order.status !== "Pending Payment";
 
   return (
     <div className="min-h-screen w-full bg-neutral-900 px-5 py-16 text-neutral-100">
@@ -101,6 +147,49 @@ function TrackOrder({ reference }) {
             <p className="mt-2 text-sm text-neutral-500">
               {order.zone} — {naira(Number(order.total || 0))}
             </p>
+
+            {order.status === "Delivered" && (
+              <div className="mt-6 rounded-lg border border-lime-400 bg-lime-400/10 p-4">
+                <div className="font-semibold" style={{ color: "#C4F135" }}>
+                  ✓ Marked as delivered{justDelivered ? " — thank you!" : ""}
+                </div>
+              </div>
+            )}
+
+            {canConfirmDelivery && (
+              <div className="mt-6 border-t border-neutral-800 pt-5">
+                <h2 className="text-sm font-bold">Received your order?</h2>
+                <p className="mt-1 text-xs text-neutral-500">
+                  Confirm delivery and attach a photo of the item you received.
+                </p>
+
+                <label className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-neutral-700 p-5 text-center hover:border-lime-400">
+                  {photoPreview ? (
+                    <img src={photoPreview} alt="Delivery proof preview" className="max-h-40 rounded-lg object-cover" />
+                  ) : (
+                    <>
+                      <span className="text-2xl">📷</span>
+                      <span className="mt-2 text-xs text-neutral-400">Tap to add a photo</span>
+                    </>
+                  )}
+                  <input type="file" accept="image/*" capture="environment" onChange={handlePhotoChange} className="hidden" />
+                </label>
+
+                {deliverError && (
+                  <div className="mt-3 rounded-lg border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-300">
+                    {deliverError}
+                  </div>
+                )}
+
+                <button
+                  onClick={submitDelivery}
+                  disabled={submitting || !photo}
+                  className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {submitting ? "Confirming…" : "Mark as Delivered"}
+                </button>
+              </div>
+            )}
           </>
         )}
 
