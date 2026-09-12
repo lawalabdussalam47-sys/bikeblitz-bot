@@ -1,7 +1,9 @@
 
+
 import os
 import csv
 import io
+import random
 import dateparser
 import json
 import logging
@@ -619,11 +621,11 @@ def get_weborders_sheet():
         try:
             return ss.worksheet("WebOrders")
         except gspread.exceptions.WorksheetNotFound:
-            ws = ss.add_worksheet(title="WebOrders", rows=1000, cols=14)
+            ws = ss.add_worksheet(title="WebOrders", rows=1000, cols=15)
             ws.append_row([
                 "Reference", "Customer Name", "Phone", "Service", "Zone", "Location",
                 "Errand Items", "Delivery Type", "Total", "Status", "Rider ID",
-                "Rider Name", "Broadcast Message ID", "Timestamp"
+                "Rider Name", "Broadcast Message ID", "Timestamp", "Pickup Code"
             ])
             return ws
     except Exception:
@@ -669,6 +671,47 @@ def update_web_order(reference, **fields):
     except Exception:
         logger.exception("Failed to update web order")
         return False
+
+
+# ---------- Pickup verification code helpers ----------
+# A short code is generated when an order is confirmed and given to the customer.
+# The rider must ask the customer for it and enter it in the bot before a delivery
+# can be marked complete, confirming the right person is receiving the package.
+
+def generate_pickup_code():
+    """Generates a random 4-digit pickup verification code as a string, e.g. '4821'."""
+    return f"{random.randint(0, 9999):04d}"
+
+
+def set_transaction_pickup_code(sheet_row, code):
+    """Writes the pickup code to column L of a Transactions row.
+    Requires a 'Pickup Code' header already present at L1 in that sheet —
+    add it once manually since this sheet already exists with fixed columns
+    (column K is already in use for something else — 'Applications')."""
+    if not sheet_row:
+        return
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return
+        sheet.update(f"L{sheet_row}", [[code]])
+    except Exception:
+        logger.exception("Failed to write pickup code to Google Sheets")
+
+
+def get_or_create_web_order_pickup_code(reference):
+    """Returns the pickup code for a web order, generating and saving one if it
+    doesn't have one yet. Requires a 'Pickup Code' header to exist in WebOrders —
+    add it once manually since update_web_order looks columns up by header name."""
+    row, order = get_web_order(reference)
+    if order is None:
+        return None
+    existing = order.get("Pickup Code")
+    if existing:
+        return existing
+    code = generate_pickup_code()
+    update_web_order(reference, **{"Pickup Code": code})
+    return code
 
 
 # ---------- Promo code helpers ----------
@@ -3112,7 +3155,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scheduled_time = context.user_data.get("scheduled_time", "")
         location_details = context.user_data.get("location_details", "Not provided")
 
-        await dispatch_confirmed_order(
+        pickup_code = await dispatch_confirmed_order(
             context, str(user.id), user.id, user.full_name, user.username,
             service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
             scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None,
@@ -3127,6 +3170,11 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if delivery_type == "Scheduled" and scheduled_time:
             confirmation += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+        if pickup_code:
+            confirmation += (
+                f"🔐 *Your pickup code: {pickup_code}*\n"
+                "Only share this with your rider when they arrive, to confirm the handoff.\n\n"
+            )
         confirmation += "Thank you for choosing BikeBlitz! 🚴"
 
         await update.message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_menu())
@@ -3171,7 +3219,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             errand_items = context.user_data.get("errand_items", "")
             location_details = context.user_data.get("location_details", "Not provided")
 
-            await dispatch_confirmed_order(
+            pickup_code = await dispatch_confirmed_order(
                 context, str(user.id), user.id, user.full_name, user.username,
                 service, zone, location_details, errand_items, delivery_type, scheduled_time, total,
                 scheduled_dt=datetime.fromisoformat(context.user_data["scheduled_datetime"]) if context.user_data.get("scheduled_datetime") else None,
@@ -3184,6 +3232,11 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if delivery_type == "Scheduled" and scheduled_time:
                 confirmation += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+            if pickup_code:
+                confirmation += (
+                    f"🔐 *Your pickup code: {pickup_code}*\n"
+                    "Only share this with your rider when they arrive, to confirm the handoff.\n\n"
+                )
             confirmation += "Thank you for being a loyal BikeBlitz customer! 🚴"
 
             await update.message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_menu())
@@ -3414,9 +3467,11 @@ async def dispatch_confirmed_order(
     service, zone, location, errand_items, delivery_type, scheduled_time, total,
     scheduled_dt=None, split_with=""
 ):
-    """Logs a fully-paid order and either broadcasts it to the rider group immediately,
-    or — for scheduled deliveries far enough out — queues the broadcast for closer to
-    the scheduled time. Shared by the admin payment-approval, wallet, and loyalty paths."""
+    """Logs a fully-paid order, generates its pickup verification code, and either
+    broadcasts it to the rider group immediately, or — for scheduled deliveries far
+    enough out — queues the broadcast for closer to the scheduled time. Shared by the
+    admin payment-approval, wallet, and loyalty paths. Returns the generated pickup code
+    so the caller can include it in the confirmation message sent to the customer."""
     sheet_row = log_transaction(
         customer_name=customer_name,
         telegram_id=customer_id,
@@ -3426,6 +3481,9 @@ async def dispatch_confirmed_order(
         delivery_type=delivery_type,
         total=total,
     )
+
+    pickup_code = generate_pickup_code()
+    set_transaction_pickup_code(sheet_row, pickup_code)
 
     claimed_orders = context.application.bot_data.setdefault("claimed_orders", {})
     claimed_orders[customer_id_str] = {
@@ -3444,6 +3502,8 @@ async def dispatch_confirmed_order(
         "rider_name": None,
         "sheet_row": sheet_row,
         "delivered": False,
+        "pickup_code": pickup_code,
+        "pickup_verified": False,
     }
 
     lead_seconds = SCHEDULED_BROADCAST_LEAD_MINUTES * 60
@@ -3456,8 +3516,9 @@ async def dispatch_confirmed_order(
                 data=customer_id_str,
                 name=f"scheduled_broadcast_{customer_id_str}",
             )
-            return
+            return pickup_code
     await broadcast_order_to_riders(context, customer_id_str)
+    return pickup_code
 
 
 async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3494,6 +3555,12 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             scheduled_dt and (scheduled_dt - datetime.now()).total_seconds() > SCHEDULED_BROADCAST_LEAD_MINUTES * 60
         )
 
+        pickup_code = await dispatch_confirmed_order(
+            context, customer_id_str, customer_id, customer_name, customer_username,
+            service, zone, location, errand_items, delivery_type, scheduled_time, total,
+            scheduled_dt=scheduled_dt, split_with=split_with
+        )
+
         msg = (
             "✅ *Payment Confirmed!*\n\n"
             f"Your delivery charge of ₦{total:,} has been verified.\n\n"
@@ -3504,6 +3571,11 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
             msg += "Your rider will be dispatched immediately ⚡\n\n"
         if delivery_type == "Scheduled" and scheduled_time:
             msg += f"📅 Your delivery is scheduled for: *{scheduled_time}*\n\n"
+        if pickup_code:
+            msg += (
+                f"🔐 *Your pickup code: {pickup_code}*\n"
+                "Only share this with your rider when they arrive, to confirm the handoff.\n\n"
+            )
         msg += "Thank you for choosing BikeBlitz! 🚴"
 
         cancel_keyboard = InlineKeyboardMarkup([
@@ -3513,12 +3585,6 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_caption(
             caption=(query.message.caption or "") + "\n\n✅ *APPROVED*",
             parse_mode="Markdown",
-        )
-
-        await dispatch_confirmed_order(
-            context, customer_id_str, customer_id, customer_name, customer_username,
-            service, zone, location, errand_items, delivery_type, scheduled_time, total,
-            scheduled_dt=scheduled_dt, split_with=split_with
         )
     else:
         await context.bot.send_message(
