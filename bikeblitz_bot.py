@@ -1,5 +1,4 @@
 
-
 import os
 import csv
 import io
@@ -1290,14 +1289,107 @@ async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Already marked as delivered.")
         return
 
-    # Ask the rider for a proof photo instead of finalizing immediately
-    awaiting = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
-    awaiting[query.from_user.id] = customer_id_str
+    if order.get("pickup_verified"):
+        # Code already confirmed earlier — go straight to proof photo
+        awaiting_proof = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
+        awaiting_proof[query.from_user.id] = customer_id_str
+        await query.answer("Almost done!")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="📸 Please send a photo of the delivered package/drop-off as proof to complete this order.",
+        )
+        return
 
-    await query.answer("Almost done!")
+    # Require the customer's pickup code before accepting proof of delivery
+    awaiting_code = context.application.bot_data.setdefault("awaiting_pickup_code", {})
+    awaiting_code[query.from_user.id] = customer_id_str
+
+    await query.answer("One more step!")
     await context.bot.send_message(
         chat_id=query.from_user.id,
-        text="📸 Please send a photo of the delivered package/drop-off as proof to complete this order.",
+        text=(
+            "🔐 Before completing this order, ask the customer for their *pickup code* "
+            "and confirm it here.\n\n"
+            "Reply with:\n`/verify CODE`\n\n"
+            "_Example: /verify 4821_"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rider-facing /verify CODE command — confirms the customer's pickup code
+    before a delivery can be marked complete. Kept as a command (rather than a
+    plain-text reply) so it doesn't collide with the main ordering conversation,
+    which treats any stray text as an entry point."""
+    rider_id = update.effective_user.id
+    awaiting_code = context.application.bot_data.get("awaiting_pickup_code", {})
+    customer_id_str = awaiting_code.get(rider_id)
+
+    if not customer_id_str:
+        await update.message.reply_text(
+            "There's no delivery waiting on a pickup code right now. "
+            "Tap 📦 Mark as Delivered on the order first."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/verify CODE` — e.g. `/verify 4821`",
+            parse_mode="Markdown",
+        )
+        return
+
+    claimed_orders = context.application.bot_data.get("claimed_orders", {})
+    order = claimed_orders.get(customer_id_str)
+    if order is None:
+        awaiting_code.pop(rider_id, None)
+        await update.message.reply_text("This order's details are no longer available.")
+        return
+
+    entered_code = context.args[0].strip()
+    correct_code = str(order.get("pickup_code", ""))
+
+    if entered_code != correct_code:
+        attempts = context.application.bot_data.setdefault("pickup_code_attempts", {})
+        count = attempts.get(rider_id, 0) + 1
+        attempts[rider_id] = count
+
+        await update.message.reply_text(
+            "❌ That code doesn't match. Double-check with the customer and try again:\n`/verify CODE`",
+            parse_mode="Markdown",
+        )
+
+        if count >= 3:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"🚩 *Pickup Code Mismatch Alert*\n\n"
+                        f"👤 Rider: {order.get('rider_name', 'Unknown')} ({rider_id})\n"
+                        f"👤 Customer: {order.get('customer_name', 'Unknown')}\n"
+                        f"🗺️ {order.get('zone', 'N/A')} — {order.get('location', 'N/A')}\n"
+                        f"🔄 {count} failed attempts so far.\n\n"
+                        "You may want to check in directly."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception("Failed to send pickup code mismatch alert")
+        return
+
+    # Correct code — clear pending state and move to the photo-proof step
+    awaiting_code.pop(rider_id, None)
+    attempts = context.application.bot_data.get("pickup_code_attempts", {})
+    attempts.pop(rider_id, None)
+    order["pickup_verified"] = True
+
+    awaiting_proof = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
+    awaiting_proof[rider_id] = customer_id_str
+
+    await update.message.reply_text(
+        "✅ Code confirmed!\n\n"
+        "📸 Now send a photo of the delivered package/drop-off as proof to complete this order."
     )
 
 
@@ -4225,6 +4317,7 @@ def main():
     app.add_handler(CommandHandler("export", export_transactions))
     app.add_handler(CommandHandler("findorder", findorder))
     app.add_handler(CommandHandler("admin", admin_help))
+    app.add_handler(CommandHandler("verify", handle_verify_code))
 
     # Global handler (separate group) — catches delivery proof photos from riders
     # regardless of what conversation state the customer-facing flow is in.
