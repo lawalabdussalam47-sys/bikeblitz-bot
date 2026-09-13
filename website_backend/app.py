@@ -1,6 +1,7 @@
 import os
 import logging
 import uuid
+import random
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -17,6 +18,13 @@ app = Flask(__name__)
 CORS(app)  # allow the frontend (hosted separately) to call this API
 
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:5173")
+
+
+def generate_pickup_code():
+    """Generates a random 4-digit pickup verification code as a string, e.g. '4821'.
+    Kept identical in format to the one the Telegram bot generates for bot-native
+    orders, though the two are independent — each backend has its own WebOrders row."""
+    return f"{random.randint(0, 9999):04d}"
 
 
 @app.route("/api/health")
@@ -135,7 +143,12 @@ def paystack_webhook():
         )
         return "", 200
 
-    sheets.update_web_order(reference, Status="Paid")
+    # Generate the pickup verification code now, at the moment payment is confirmed —
+    # only if this order doesn't already have one (webhooks can be delivered more than
+    # once, and we don't want a retry to hand the customer a second, different code).
+    pickup_code = order.get("Pickup Code") or generate_pickup_code()
+
+    sheets.update_web_order(reference, **{"Status": "Paid", "Pickup Code": pickup_code})
     sheets.log_transaction(
         customer_name=order.get("Customer Name"),
         telegram_id=None,
@@ -172,6 +185,7 @@ def order_status(reference):
         "riderName": order.get("Rider Name") or None,
         "zone": order.get("Zone"),
         "total": order.get("Total"),
+        "pickupCode": order.get("Pickup Code") or None,
     })
 
 
@@ -186,6 +200,17 @@ def confirm_delivery(reference):
 
     if order.get("Status") == "Delivered":
         return jsonify({"error": "This order has already been marked as delivered."}), 400
+
+    entered_code = (request.form.get("pickupCode") or "").strip()
+    correct_code = str(order.get("Pickup Code") or "")
+    if not correct_code:
+        # No code was ever generated for this order — don't silently skip verification,
+        # since that would make it easy to bypass just by hitting an older/unpaid order.
+        return jsonify({"error": "This order has no pickup code on file — contact the admin."}), 400
+    if not entered_code:
+        return jsonify({"error": "Pickup code is required to confirm delivery."}), 400
+    if entered_code != correct_code:
+        return jsonify({"error": "That pickup code doesn't match. Ask the customer to confirm it."}), 400
 
     photo = request.files.get("photo")
     if not photo or not photo.filename:
