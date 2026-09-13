@@ -1302,7 +1302,7 @@ async def handle_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Require the customer's pickup code before accepting proof of delivery
     awaiting_code = context.application.bot_data.setdefault("awaiting_pickup_code", {})
-    awaiting_code[query.from_user.id] = customer_id_str
+    awaiting_code[query.from_user.id] = {"kind": "native", "ref": customer_id_str}
 
     await query.answer("One more step!")
     await context.bot.send_message(
@@ -1321,12 +1321,13 @@ async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Rider-facing /verify CODE command — confirms the customer's pickup code
     before a delivery can be marked complete. Kept as a command (rather than a
     plain-text reply) so it doesn't collide with the main ordering conversation,
-    which treats any stray text as an entry point."""
+    which treats any stray text as an entry point. Handles both bot-native orders
+    (claimed_orders, in-memory) and web orders (WebOrders sheet)."""
     rider_id = update.effective_user.id
     awaiting_code = context.application.bot_data.get("awaiting_pickup_code", {})
-    customer_id_str = awaiting_code.get(rider_id)
+    pending = awaiting_code.get(rider_id)
 
-    if not customer_id_str:
+    if not pending:
         await update.message.reply_text(
             "There's no delivery waiting on a pickup code right now. "
             "Tap 📦 Mark as Delivered on the order first."
@@ -1340,15 +1341,33 @@ async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    claimed_orders = context.application.bot_data.get("claimed_orders", {})
-    order = claimed_orders.get(customer_id_str)
-    if order is None:
-        awaiting_code.pop(rider_id, None)
-        await update.message.reply_text("This order's details are no longer available.")
-        return
-
     entered_code = context.args[0].strip()
-    correct_code = str(order.get("pickup_code", ""))
+    kind = pending.get("kind")
+    ref = pending.get("ref")
+
+    if kind == "web":
+        row, order = get_web_order(ref)
+        if order is None:
+            awaiting_code.pop(rider_id, None)
+            await update.message.reply_text("This order's details are no longer available.")
+            return
+        correct_code = str(order.get("Pickup Code", ""))
+        rider_name_display = order.get("Rider Name", "Unknown")
+        customer_name_display = order.get("Customer Name", "Unknown")
+        zone_display = order.get("Zone", "N/A")
+        location_display = order.get("Location", "N/A")
+    else:
+        claimed_orders = context.application.bot_data.get("claimed_orders", {})
+        order = claimed_orders.get(ref)
+        if order is None:
+            awaiting_code.pop(rider_id, None)
+            await update.message.reply_text("This order's details are no longer available.")
+            return
+        correct_code = str(order.get("pickup_code", ""))
+        rider_name_display = order.get("rider_name", "Unknown")
+        customer_name_display = order.get("customer_name", "Unknown")
+        zone_display = order.get("zone", "N/A")
+        location_display = order.get("location", "N/A")
 
     if entered_code != correct_code:
         attempts = context.application.bot_data.setdefault("pickup_code_attempts", {})
@@ -1366,9 +1385,9 @@ async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=ADMIN_CHAT_ID,
                     text=(
                         f"🚩 *Pickup Code Mismatch Alert*\n\n"
-                        f"👤 Rider: {order.get('rider_name', 'Unknown')} ({rider_id})\n"
-                        f"👤 Customer: {order.get('customer_name', 'Unknown')}\n"
-                        f"🗺️ {order.get('zone', 'N/A')} — {order.get('location', 'N/A')}\n"
+                        f"👤 Rider: {rider_name_display} ({rider_id})\n"
+                        f"👤 Customer: {customer_name_display}\n"
+                        f"🗺️ {zone_display} — {location_display}\n"
                         f"🔄 {count} failed attempts so far.\n\n"
                         "You may want to check in directly."
                     ),
@@ -1378,19 +1397,32 @@ async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logger.exception("Failed to send pickup code mismatch alert")
         return
 
-    # Correct code — clear pending state and move to the photo-proof step
+    # Correct code — clear pending state
     awaiting_code.pop(rider_id, None)
     attempts = context.application.bot_data.get("pickup_code_attempts", {})
     attempts.pop(rider_id, None)
-    order["pickup_verified"] = True
 
-    awaiting_proof = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
-    awaiting_proof[rider_id] = customer_id_str
-
-    await update.message.reply_text(
-        "✅ Code confirmed!\n\n"
-        "📸 Now send a photo of the delivered package/drop-off as proof to complete this order."
-    )
+    if kind == "web":
+        # Web orders have no photo-proof step — verifying the code completes the delivery.
+        update_web_order(ref, Status="Delivered")
+        record_rider_completion(rider_id, int(order.get("Total", 0) or 0))
+        await update.message.reply_text("✅ Code confirmed — delivery marked complete! Great work 🚴")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"📦 Web order {ref} delivered by {rider_name_display} (pickup code verified).",
+            )
+        except Exception:
+            logger.exception("Could not notify admin of web order delivery")
+    else:
+        # Bot-native orders still need a photo before the order is truly complete.
+        order["pickup_verified"] = True
+        awaiting_proof = context.application.bot_data.setdefault("awaiting_delivery_proof", {})
+        awaiting_proof[rider_id] = ref
+        await update.message.reply_text(
+            "✅ Code confirmed!\n\n"
+            "📸 Now send a photo of the delivered package/drop-off as proof to complete this order."
+        )
 
 
 async def handle_rider_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3807,7 +3839,10 @@ async def handle_web_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_web_delivered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Marks a web order delivered. No photo-proof step in v1 — simpler by design."""
+    """Requires the customer's pickup code before a web order can be marked delivered.
+    Still no photo-proof step for web orders — that stays simpler by design — but the
+    code check closes the gap where tapping this button used to complete instantly
+    with zero verification."""
     query = update.callback_query
     _, reference = query.data.split(":", 1)
 
@@ -3822,21 +3857,20 @@ async def handle_web_delivered(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Already marked as delivered.")
         return
 
-    update_web_order(reference, Status="Delivered")
-    record_rider_completion(query.from_user.id, int(order.get("Total", 0) or 0))
+    awaiting_code = context.application.bot_data.setdefault("awaiting_pickup_code", {})
+    awaiting_code[query.from_user.id] = {"kind": "web", "ref": reference}
 
-    await query.answer("Delivery marked complete!")
-    await query.edit_message_text(
-        (query.message.text or "") + "\n\n✅ *DELIVERED*",
+    await query.answer("One more step!")
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            "🔐 Before completing this order, ask the customer for their *pickup code* "
+            "and confirm it here.\n\n"
+            "Reply with:\n`/verify CODE`\n\n"
+            "_Example: /verify 4821_"
+        ),
         parse_mode="Markdown",
     )
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"📦 Web order {reference} delivered by {order.get('Rider Name')}.",
-        )
-    except Exception:
-        logger.exception("Could not notify admin of web order delivery")
 
 
 async def handle_rider_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
