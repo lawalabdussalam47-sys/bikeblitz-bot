@@ -45,7 +45,6 @@ function TrackOrder({ reference }) {
   const [error, setError] = useState("");
   const [photo, setPhoto] = useState(null);
   const [photoPreview, setPhotoPreview] = useState(null);
-  const [pickupCodeInput, setPickupCodeInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [deliverError, setDeliverError] = useState("");
   const [justDelivered, setJustDelivered] = useState(false);
@@ -88,10 +87,6 @@ function TrackOrder({ reference }) {
   };
 
   const submitDelivery = async () => {
-    if (!pickupCodeInput.trim()) {
-      setDeliverError("Please enter your pickup code.");
-      return;
-    }
     if (!photo) {
       setDeliverError("Please attach a photo showing the delivered item.");
       return;
@@ -101,7 +96,6 @@ function TrackOrder({ reference }) {
     try {
       const formData = new FormData();
       formData.append("photo", photo);
-      formData.append("pickupCode", pickupCodeInput.trim());
       const res = await fetch(`${API_BASE}/api/orders/${reference}/deliver`, {
         method: "POST",
         body: formData,
@@ -178,19 +172,8 @@ function TrackOrder({ reference }) {
               <div className="mt-6 border-t border-neutral-800 pt-5">
                 <h2 className="text-sm font-bold">Received your order?</h2>
                 <p className="mt-1 text-xs text-neutral-500">
-                  Enter your pickup code and attach a photo of the item you received.
+                  Attach a photo of the item you received to confirm delivery.
                 </p>
-
-                <div className="mt-4">
-                  <label className="mb-1 block text-xs font-semibold text-neutral-400">Pickup code</label>
-                  <input
-                    value={pickupCodeInput}
-                    onChange={(e) => setPickupCodeInput(e.target.value)}
-                    placeholder="e.g. 4821"
-                    inputMode="numeric"
-                    className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-center font-mono text-lg tracking-widest outline-none focus:border-lime-400"
-                  />
-                </div>
 
                 <label className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-neutral-700 p-5 text-center hover:border-lime-400">
                   {photoPreview ? (
@@ -212,7 +195,7 @@ function TrackOrder({ reference }) {
 
                 <button
                   onClick={submitDelivery}
-                  disabled={submitting || !photo || !pickupCodeInput.trim()}
+                  disabled={submitting || !photo}
                   className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
                 >
                   {submitting ? "Confirming…" : "Mark as Delivered"}
