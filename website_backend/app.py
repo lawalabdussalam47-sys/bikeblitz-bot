@@ -146,6 +146,11 @@ def paystack_webhook():
     # Generate the pickup verification code now, at the moment payment is confirmed —
     # only if this order doesn't already have one (webhooks can be delivered more than
     # once, and we don't want a retry to hand the customer a second, different code).
+    # This code is shown to the customer on the tracking page; the RIDER is the one who
+    # enters it (via /verify in Telegram, after asking the customer for it in person) —
+    # that's the actual security check. The website's own /deliver endpoint below does
+    # NOT require this code, since a customer confirming their own delivery by re-typing
+    # a code already shown to them isn't meaningful verification.
     pickup_code = order.get("Pickup Code") or generate_pickup_code()
 
     sheets.update_web_order(reference, **{"Status": "Paid", "Pickup Code": pickup_code})
@@ -189,28 +194,19 @@ def order_status(reference):
     })
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10001"))
-    app.run(host="0.0.0.0", port=port)
 @app.route("/api/orders/<reference>/deliver", methods=["POST"])
 def confirm_delivery(reference):
+    """Customer-facing self-confirmation: the customer marks their own order delivered
+    and attaches a photo as proof. This does NOT check the pickup code — that
+    verification happens separately and more meaningfully on the rider's side, via the
+    /verify command in Telegram, where the rider has to actually ask the customer for
+    the code in person before the bot lets them complete the delivery."""
     order = sheets.get_web_order(reference)
     if order is None:
         return jsonify({"error": "Order not found"}), 404
 
     if order.get("Status") == "Delivered":
         return jsonify({"error": "This order has already been marked as delivered."}), 400
-
-    entered_code = (request.form.get("pickupCode") or "").strip()
-    correct_code = str(order.get("Pickup Code") or "")
-    if not correct_code:
-        # No code was ever generated for this order — don't silently skip verification,
-        # since that would make it easy to bypass just by hitting an older/unpaid order.
-        return jsonify({"error": "This order has no pickup code on file — contact the admin."}), 400
-    if not entered_code:
-        return jsonify({"error": "Pickup code is required to confirm delivery."}), 400
-    if entered_code != correct_code:
-        return jsonify({"error": "That pickup code doesn't match. Ask the customer to confirm it."}), 400
 
     photo = request.files.get("photo")
     if not photo or not photo.filename:
@@ -231,3 +227,8 @@ def confirm_delivery(reference):
     )
 
     return jsonify({"reference": reference, "status": "Delivered"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10001"))
+    app.run(host="0.0.0.0", port=port)
