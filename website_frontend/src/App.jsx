@@ -45,6 +45,7 @@ function TrackOrder({ reference }) {
   const [error, setError] = useState("");
   const [photo, setPhoto] = useState(null);
   const [photoPreview, setPhotoPreview] = useState(null);
+  const [pickupCodeInput, setPickupCodeInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [deliverError, setDeliverError] = useState("");
   const [justDelivered, setJustDelivered] = useState(false);
@@ -87,6 +88,10 @@ function TrackOrder({ reference }) {
   };
 
   const submitDelivery = async () => {
+    if (!pickupCodeInput.trim()) {
+      setDeliverError("Please enter your pickup code.");
+      return;
+    }
     if (!photo) {
       setDeliverError("Please attach a photo showing the delivered item.");
       return;
@@ -96,6 +101,7 @@ function TrackOrder({ reference }) {
     try {
       const formData = new FormData();
       formData.append("photo", photo);
+      formData.append("pickupCode", pickupCodeInput.trim());
       const res = await fetch(`${API_BASE}/api/orders/${reference}/deliver`, {
         method: "POST",
         body: formData,
@@ -148,6 +154,18 @@ function TrackOrder({ reference }) {
               {order.zone} — {naira(Number(order.total || 0))}
             </p>
 
+            {order.pickupCode && order.status !== "Delivered" && (
+              <div className="mt-5 rounded-lg border border-lime-400/50 bg-lime-400/10 p-4">
+                <div className="text-xs text-neutral-400">Your pickup code</div>
+                <div className="mt-1 font-mono text-2xl font-black tracking-widest" style={{ color: "#C4F135" }}>
+                  {order.pickupCode}
+                </div>
+                <div className="mt-1 text-xs text-neutral-400">
+                  Only share this with your rider in person, once they arrive to confirm the handoff.
+                </div>
+              </div>
+            )}
+
             {order.status === "Delivered" && (
               <div className="mt-6 rounded-lg border border-lime-400 bg-lime-400/10 p-4">
                 <div className="font-semibold" style={{ color: "#C4F135" }}>
@@ -160,8 +178,19 @@ function TrackOrder({ reference }) {
               <div className="mt-6 border-t border-neutral-800 pt-5">
                 <h2 className="text-sm font-bold">Received your order?</h2>
                 <p className="mt-1 text-xs text-neutral-500">
-                  Confirm delivery and attach a photo of the item you received.
+                  Enter your pickup code and attach a photo of the item you received.
                 </p>
+
+                <div className="mt-4">
+                  <label className="mb-1 block text-xs font-semibold text-neutral-400">Pickup code</label>
+                  <input
+                    value={pickupCodeInput}
+                    onChange={(e) => setPickupCodeInput(e.target.value)}
+                    placeholder="e.g. 4821"
+                    inputMode="numeric"
+                    className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-center font-mono text-lg tracking-widest outline-none focus:border-lime-400"
+                  />
+                </div>
 
                 <label className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-neutral-700 p-5 text-center hover:border-lime-400">
                   {photoPreview ? (
@@ -183,7 +212,7 @@ function TrackOrder({ reference }) {
 
                 <button
                   onClick={submitDelivery}
-                  disabled={submitting || !photo}
+                  disabled={submitting || !photo || !pickupCodeInput.trim()}
                   className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
                 >
                   {submitting ? "Confirming…" : "Mark as Delivered"}
