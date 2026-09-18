@@ -161,9 +161,9 @@ def get_customers_sheet():
         try:
             return ss.worksheet("Customers")
         except gspread.exceptions.WorksheetNotFound:
-            ws = ss.add_worksheet(title="Customers", rows=1000, cols=6)
+            ws = ss.add_worksheet(title="Customers", rows=1000, cols=7)
             ws.append_row([
-                "Phone", "Name", "Session Token", "Wallet Balance",
+                "Email", "Phone", "Name", "Session Token", "Wallet Balance",
                 "Referral Code", "Credit Balance"
             ])
             return ws
@@ -172,10 +172,12 @@ def get_customers_sheet():
         return None
 
 
-def get_or_create_customer(phone, name=""):
-    """Ensures a Customers row exists for this phone; returns the row dict with a
-    freshly generated session token. Call this only right after OTP verification
-    succeeds, not on every request — each call issues (and overwrites) a new token."""
+def get_or_create_customer(email, phone="", name=""):
+    """Ensures a Customers row exists for this email; returns the row dict with a
+    freshly generated session token. Phone is stored too (even though email is the
+    identity key) so order history can still be matched against WebOrders, which is
+    keyed by phone. Call this only right after code verification succeeds, not on
+    every request — each call issues (and overwrites) a new token."""
     ws = get_customers_sheet()
     if ws is None:
         return None
@@ -184,14 +186,18 @@ def get_or_create_customer(phone, name=""):
         headers = rows[0] if rows else []
         token = uuid.uuid4().hex
         for idx, row in enumerate(rows[1:], start=2):
-            if row and row[0] == phone:
-                ws.update(f"C{idx}", [[token]])
+            if row and row[0] == email:
+                ws.update(f"D{idx}", [[token]])
+                if phone:
+                    ws.update(f"B{idx}", [[phone]])
                 record = dict(zip(headers, row))
                 record["Session Token"] = token
+                if phone:
+                    record["Phone"] = phone
                 return record
-        ws.append_row([phone, name, token, 0, "", 0])
+        ws.append_row([email, phone, name, token, 0, "", 0])
         return {
-            "Phone": phone, "Name": name, "Session Token": token,
+            "Email": email, "Phone": phone, "Name": name, "Session Token": token,
             "Wallet Balance": "0", "Referral Code": "", "Credit Balance": "0",
         }
     except Exception:
