@@ -64,12 +64,13 @@ def create_order():
     errand_type = body.get("errandType")
     errand_items = body.get("errandItems", "")
     express = bool(body.get("express"))
+    scheduled_time = (body.get("scheduledTime") or "").strip()
     far_busstop = bool(body.get("farBusstop"))
     location = (body.get("location") or "").strip()
     customer_name = (body.get("customerName") or "").strip()
     phone = (body.get("phone") or "").strip()
     email = (body.get("email") or "").strip()
-    delivery_type = "Express" if express else "Standard"
+    delivery_type = f"Scheduled: {scheduled_time}" if scheduled_time else ("Express" if express else "Standard")
 
     if not customer_name or not phone or not email or not location:
         return jsonify({"error": "Name, phone, email, and location are all required."}), 400
