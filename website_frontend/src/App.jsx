@@ -245,6 +245,46 @@ function OrderFlow() {
   const [checkoutError, setCheckoutError] = useState("");
   const [onlineRiders, setOnlineRiders] = useState(null); // null = not loaded yet
 
+  const [showAccount, setShowAccount] = useState(false);
+  const [sessionToken, setSessionToken] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_token") : null));
+  const [accountPhone, setAccountPhone] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_phone") : null));
+  const [accountName, setAccountName] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_name") : null));
+
+  const handleLoggedIn = ({ token, phone, name }) => {
+    localStorage.setItem("bb_token", token);
+    localStorage.setItem("bb_phone", phone);
+    localStorage.setItem("bb_name", name || "");
+    setSessionToken(token);
+    setAccountPhone(phone);
+    setAccountName(name || "");
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("bb_token");
+    localStorage.removeItem("bb_phone");
+    localStorage.removeItem("bb_name");
+    setSessionToken(null);
+    setAccountPhone(null);
+    setAccountName(null);
+  };
+
+  const applyReorder = (order) => {
+    setService(order.service);
+    const matchedZone = ZONES.find((z) => z.name === order.zone);
+    if (matchedZone) setZoneId(matchedZone.id);
+    if (order.service === "B2C") {
+      const matchedErrand = Object.keys(ERRAND_FEES).find((t) => t === order.errandType) || Object.keys(ERRAND_FEES)[0];
+      setErrandType(matchedErrand);
+      setErrandItems(order.errandItems || "");
+    }
+    setExpress((order.deliveryType || "").startsWith("Express"));
+    setLocation(order.location || "");
+    setCustomerName(accountName || "");
+    setPhone(accountPhone || "");
+    setShowAccount(false);
+    setStep(matchedZone ? 1 : 0);
+  };
+
   useEffect(() => {
     let cancelled = false;
     fetch(`${API_BASE}/api/riders/status`)
@@ -348,7 +388,12 @@ function OrderFlow() {
             <span>Zones</span>
             <span>Ride for us</span>
           </div>
-          <div className="rounded-full border border-neutral-700 px-3 py-1 font-mono text-xs text-neutral-400">FUNAAB · Abeokuta</div>
+          <button
+            onClick={() => setShowAccount(true)}
+            className="rounded-full border border-neutral-700 px-3 py-1 font-mono text-xs text-neutral-300 hover:border-lime-400"
+          >
+            {accountName ? `👤 ${accountName.split(" ")[0]}` : "Sign in"}
+          </button>
         </div>
       </header>
 
@@ -741,6 +786,169 @@ function OrderFlow() {
       <footer className="border-t border-neutral-800 px-5 py-8 text-center text-xs text-neutral-600">
         BikeBlitz — student-powered campus delivery at FUNAAB, Abeokuta. Checkout connects to your website_backend service.
       </footer>
+
+      {showAccount && (
+        <AccountPanel
+          sessionToken={sessionToken}
+          accountPhone={accountPhone}
+          accountName={accountName}
+          onLoggedIn={handleLoggedIn}
+          onLogout={handleLogout}
+          onReorder={applyReorder}
+          onClose={() => setShowAccount(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onLogout, onReorder, onClose }) {
+  const [phase, setPhase] = useState(sessionToken ? "history" : "phone"); // phone | code | history
+  const [phoneInput, setPhoneInput] = useState("");
+  const [nameInput, setNameInput] = useState("");
+  const [codeInput, setCodeInput] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [orders, setOrders] = useState(null);
+
+  useEffect(() => {
+    if (phase !== "history" || !sessionToken) return;
+    let cancelled = false;
+    fetch(`${API_BASE}/api/orders/history`, { headers: { "X-Session-Token": sessionToken } })
+      .then((res) => res.json())
+      .then((data) => { if (!cancelled) setOrders(data.orders || []); })
+      .catch(() => { if (!cancelled) setOrders([]); });
+    return () => { cancelled = true; };
+  }, [phase, sessionToken]);
+
+  const sendCode = async () => {
+    if (!phoneInput.trim()) { setError("Enter your phone number."); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/send-otp`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: phoneInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "Couldn't send code."); setBusy(false); return; }
+      setPhase("code");
+    } catch (e) {
+      setError("Couldn't reach the server.");
+    }
+    setBusy(false);
+  };
+
+  const verifyCode = async () => {
+    if (!codeInput.trim()) { setError("Enter the code you received."); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/verify-otp`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: phoneInput.trim(), code: codeInput.trim(), name: nameInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "That code didn't work."); setBusy(false); return; }
+      onLoggedIn({ token: data.token, phone: data.phone, name: data.name || nameInput.trim() });
+      setPhase("history");
+    } catch (e) {
+      setError("Couldn't reach the server.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 sm:items-center" onClick={onClose}>
+      <div
+        className="w-full max-w-md rounded-t-2xl border border-neutral-800 bg-neutral-900 p-6 sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-bold">{phase === "history" ? "Your account" : "Sign in"}</h2>
+          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-200">✕</button>
+        </div>
+
+        {phase === "phone" && (
+          <div>
+            <label className="mb-1 block text-sm font-semibold">Phone number</label>
+            <input
+              value={phoneInput}
+              onChange={(e) => setPhoneInput(e.target.value)}
+              placeholder="0801 234 5678"
+              className="w-full rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-sm outline-none focus:border-lime-400"
+            />
+            <label className="mb-1 mt-3 block text-sm font-semibold">Your name (optional)</label>
+            <input
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              placeholder="Full name"
+              className="w-full rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-sm outline-none focus:border-lime-400"
+            />
+            {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+            <button
+              onClick={sendCode}
+              disabled={busy}
+              className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 disabled:opacity-50"
+            >
+              {busy ? "Sending…" : "Send verification code"}
+            </button>
+          </div>
+        )}
+
+        {phase === "code" && (
+          <div>
+            <p className="mb-3 text-sm text-neutral-400">Enter the code sent to {phoneInput}</p>
+            <input
+              value={codeInput}
+              onChange={(e) => setCodeInput(e.target.value)}
+              placeholder="1234"
+              inputMode="numeric"
+              className="w-full rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-center font-mono text-lg tracking-widest outline-none focus:border-lime-400"
+            />
+            {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+            <button
+              onClick={verifyCode}
+              disabled={busy}
+              className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 disabled:opacity-50"
+            >
+              {busy ? "Verifying…" : "Verify & sign in"}
+            </button>
+            <button onClick={() => setPhase("phone")} className="mt-2 w-full text-sm text-neutral-500 hover:text-neutral-300">
+              ← Change number
+            </button>
+          </div>
+        )}
+
+        {phase === "history" && (
+          <div>
+            <p className="mb-3 text-sm text-neutral-400">Signed in as {accountName || accountPhone}</p>
+            {orders === null && <p className="text-sm text-neutral-500">Loading your orders…</p>}
+            {orders && orders.length === 0 && <p className="text-sm text-neutral-500">No past orders yet.</p>}
+            {orders && orders.length > 0 && (
+              <div className="max-h-80 space-y-2 overflow-y-auto">
+                {orders.map((o) => (
+                  <div key={o.reference} className="rounded-lg border border-neutral-800 p-3 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold">{o.zone}</span>
+                      <span className="font-mono text-xs text-neutral-500">{o.status}</span>
+                    </div>
+                    <div className="mt-1 text-xs text-neutral-500">{o.timestamp} — ₦{Number(o.total || 0).toLocaleString()}</div>
+                    <button
+                      onClick={() => onReorder(o)}
+                      className="mt-2 text-xs font-semibold underline"
+                      style={{ color: "#C4F135" }}
+                    >
+                      Reorder this
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button onClick={onLogout} className="mt-4 w-full text-sm text-neutral-500 hover:text-neutral-300">
+              Sign out
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
