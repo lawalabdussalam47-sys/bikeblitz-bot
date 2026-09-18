@@ -1,26 +1,27 @@
 """
-Email-based OTP verification for website customer identity, sent via Gmail SMTP.
-Switched to email instead of SMS after discovering Termii requires business KYC
-(CAC registration) before it'll activate Nigeria for OTP SMS sending — this sidesteps
-that entirely, at zero cost, since customers already provide an email at checkout.
+Email-based OTP verification for website customer identity, sent via Resend's
+HTTPS API. Originally built on Gmail SMTP, but Render's free tier blocks
+outbound SMTP ports (587/465/25) entirely to prevent spam abuse — this hit an
+"OSError: Network is unreachable" in production. Resend sends over regular
+HTTPS (port 443), which isn't blocked, and needs no business KYC to get started.
 
-Codes are generated and checked here (not by a third-party OTP service), stored
-in-memory keyed by email. Fine for Render's free single-instance tier — if you ever
-scale to multiple instances, this needs to move to the Customers sheet instead.
+Codes are generated and checked here (not by Resend), stored in-memory keyed
+by email. Fine for Render's free single-instance tier — if you ever scale to
+multiple instances, this needs to move to the Customers sheet instead.
 """
 import os
 import random
-import smtplib
 import logging
-from email.mime.text import MIMEText
+import requests
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
-EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+# Resend's shared test sender — works immediately with zero setup. Once BikeBlitz
+# has its own verified domain on Resend, swap this for something like
+# "BikeBlitz <noreply@bikeblitz.com>" — no other code changes needed.
+FROM_ADDRESS = os.environ.get("RESEND_FROM_ADDRESS", "BikeBlitz <onboarding@resend.dev>")
 
 CODE_TTL_MINUTES = 10
 CODE_MAX_ATTEMPTS = 5
@@ -33,9 +34,9 @@ def _generate_code():
 
 
 def send_code(email):
-    """Generates a 4-digit code, emails it, and stashes it for later verification.
-    Returns (ok: bool, error: str|None)."""
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+    """Generates a 4-digit code, emails it via Resend, and stashes it for later
+    verification. Returns (ok: bool, error: str|None)."""
+    if not RESEND_API_KEY:
         return False, "Email verification isn't configured yet — contact the admin."
 
     code = _generate_code()
@@ -45,26 +46,32 @@ def send_code(email):
         "attempts": 0,
     }
 
-    body = (
-        f"Your BikeBlitz verification code is {code}.\n\n"
-        f"This code expires in {CODE_TTL_MINUTES} minutes. Do not share it with anyone.\n\n"
-        "— BikeBlitz"
-    )
-    msg = MIMEText(body)
-    msg["Subject"] = f"Your BikeBlitz verification code: {code}"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = email
-
+    payload = {
+        "from": FROM_ADDRESS,
+        "to": [email],
+        "subject": f"Your BikeBlitz verification code: {code}",
+        "text": (
+            f"Your BikeBlitz verification code is {code}.\n\n"
+            f"This code expires in {CODE_TTL_MINUTES} minutes. Do not share it with anyone.\n\n"
+            "— BikeBlitz"
+        ),
+    }
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, [email], msg.as_string())
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if not resp.ok:
+            logger.error(f"Resend send failed: {resp.status_code} {resp.text}")
+            _pending_codes.pop(email, None)
+            return False, "Couldn't send the verification email — try again shortly."
         return True, None
     except Exception:
-        logger.exception("Failed to send verification email")
+        logger.exception("Failed to call Resend API")
         _pending_codes.pop(email, None)
-        return False, "Couldn't send the verification email — try again shortly."
+        return False, "Couldn't reach the email service — try again shortly."
 
 
 def verify_code(email, entered_code):
