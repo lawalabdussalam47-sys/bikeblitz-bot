@@ -8,6 +8,7 @@ sheet structure changes in the bot, mirror the change here too.
 import os
 import json
 import logging
+import uuid
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -68,11 +69,11 @@ def get_weborders_sheet():
         try:
             return ss.worksheet("WebOrders")
         except gspread.exceptions.WorksheetNotFound:
-            ws = ss.add_worksheet(title="WebOrders", rows=1000, cols=14)
+            ws = ss.add_worksheet(title="WebOrders", rows=1000, cols=15)
             ws.append_row([
                 "Reference", "Customer Name", "Phone", "Service", "Zone", "Location",
                 "Errand Items", "Delivery Type", "Total", "Status", "Rider ID",
-                "Rider Name", "Broadcast Message ID", "Timestamp"
+                "Rider Name", "Broadcast Message ID", "Timestamp", "Pickup Code"
             ])
             return ws
     except Exception:
@@ -142,3 +143,74 @@ def log_transaction(customer_name, telegram_id, service, zone, location, deliver
         location, delivery_type, total, "Pending", ""
     ])
     return len(sheet.get_all_values())
+
+
+# ---------- Website customer identity (phone + OTP based) ----------
+# This is the website's own customer identity table, keyed by phone number,
+# separate from the bot's Telegram-ID-based identity in the Riders/Transactions
+# sheets. A customer who orders via both bot and website currently has two
+# separate histories — unifying them is a future step, not this one.
+
+def get_customers_sheet():
+    """Returns the 'Customers' worksheet, creating it with headers if it doesn't exist yet."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return None
+    try:
+        import gspread
+        try:
+            return ss.worksheet("Customers")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Customers", rows=1000, cols=6)
+            ws.append_row([
+                "Phone", "Name", "Session Token", "Wallet Balance",
+                "Referral Code", "Credit Balance"
+            ])
+            return ws
+    except Exception:
+        logger.exception("Failed to access Customers worksheet")
+        return None
+
+
+def get_or_create_customer(phone, name=""):
+    """Ensures a Customers row exists for this phone; returns the row dict with a
+    freshly generated session token. Call this only right after OTP verification
+    succeeds, not on every request — each call issues (and overwrites) a new token."""
+    ws = get_customers_sheet()
+    if ws is None:
+        return None
+    try:
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        token = uuid.uuid4().hex
+        for idx, row in enumerate(rows[1:], start=2):
+            if row and row[0] == phone:
+                ws.update(f"C{idx}", [[token]])
+                record = dict(zip(headers, row))
+                record["Session Token"] = token
+                return record
+        ws.append_row([phone, name, token, 0, "", 0])
+        return {
+            "Phone": phone, "Name": name, "Session Token": token,
+            "Wallet Balance": "0", "Referral Code": "", "Credit Balance": "0",
+        }
+    except Exception:
+        logger.exception("Failed to get/create customer")
+        return None
+
+
+def get_customer_by_token(token):
+    """Looks up a customer by their session token — used to authenticate requests
+    from the website (sent as a header or query param) without needing OTP every time."""
+    ws = get_customers_sheet()
+    if ws is None:
+        return None
+    try:
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Session Token", "")) == str(token):
+                return r
+        return None
+    except Exception:
+        logger.exception("Failed to look up customer by token")
+        return None
