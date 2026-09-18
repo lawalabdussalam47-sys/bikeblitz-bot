@@ -260,6 +260,9 @@ function OrderFlow() {
     setAccountPhone(phone || "");
     setAccountEmail(email || "");
     setAccountName(name || "");
+    if (name) setCustomerName(name);
+    if (phone) setPhone(phone);
+    if (email) setEmail(email);
   };
 
   const handleLogout = () => {
@@ -377,7 +380,9 @@ function OrderFlow() {
     setCheckoutError("");
   };
 
-  const steps = ["Service", "Zone & type", "Details", "Review", "Pay"];
+  const orderSteps = ["Service", "Zone & type", "Details", "Review", "Pay"];
+  const steps = ["Sign in", ...orderSteps];
+  const overallIndex = sessionToken ? step + 1 : 0;
 
   return (
     <div className="min-h-screen w-full bg-neutral-900 text-neutral-100" style={{ fontFamily: "'Helvetica Neue', Arial, sans-serif" }}>
@@ -441,7 +446,7 @@ function OrderFlow() {
         {/* Route line */}
         <div className="hidden md:block">
           {steps.map((label, i) => (
-            <RouteDot key={label} index={i + 1} label={label} active={step === i} done={step > i} />
+            <RouteDot key={label} index={i + 1} label={label} active={overallIndex === i} done={overallIndex > i} />
           ))}
         </div>
 
@@ -449,11 +454,21 @@ function OrderFlow() {
         <div className="rounded-2xl border border-neutral-800 bg-neutral-850 bg-neutral-800/40 p-6 sm:p-8">
           <div className="mb-6 flex items-center justify-between md:hidden">
             <span className="font-mono text-xs text-neutral-500">
-              Step {step + 1} of {steps.length}
+              Step {overallIndex + 1} of {steps.length}
             </span>
-            <span className="text-sm font-semibold">{steps[step]}</span>
+            <span className="text-sm font-semibold">{steps[overallIndex]}</span>
           </div>
 
+          {!sessionToken && (
+            <InlineAuth
+              onLoggedIn={(data) => {
+                handleLoggedIn(data);
+              }}
+            />
+          )}
+
+          {sessionToken && (
+          <>
           {/* Step 0: service */}
           {step === 0 && (
             <div>
@@ -774,7 +789,7 @@ function OrderFlow() {
               >
                 ← Back
               </button>
-              {step < steps.length - 1 && (
+              {step < orderSteps.length - 1 && (
                 <button
                   onClick={() => canAdvance() && setStep((s) => s + 1)}
                   disabled={!canAdvance()}
@@ -784,6 +799,8 @@ function OrderFlow() {
                 </button>
               )}
             </div>
+          )}
+          </>
           )}
         </div>
       </section>
@@ -803,6 +820,130 @@ function OrderFlow() {
           onReorder={applyReorder}
           onClose={() => setShowAccount(false)}
         />
+      )}
+    </div>
+  );
+}
+
+function InlineAuth({ onLoggedIn }) {
+  const [phase, setPhase] = useState("email"); // email | code
+  const [emailInput, setEmailInput] = useState("");
+  const [phoneInput, setPhoneInput] = useState("");
+  const [nameInput, setNameInput] = useState("");
+  const [codeInput, setCodeInput] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const sendCode = async () => {
+    if (!emailInput.trim() || !/\S+@\S+\.\S+/.test(emailInput.trim())) {
+      setError("Enter a valid email address.");
+      return;
+    }
+    if (!phoneInput.trim()) { setError("Enter your phone number."); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/send-otp`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: emailInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "Couldn't send code."); setBusy(false); return; }
+      setPhase("code");
+    } catch (e) {
+      setError("Couldn't reach the server.");
+    }
+    setBusy(false);
+  };
+
+  const verifyCode = async () => {
+    if (!codeInput.trim()) { setError("Enter the code you received."); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/verify-otp`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: emailInput.trim(),
+          code: codeInput.trim(),
+          name: nameInput.trim(),
+          phone: phoneInput.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "That code didn't work."); setBusy(false); return; }
+      onLoggedIn({ token: data.token, email: data.email, phone: data.phone, name: data.name || nameInput.trim() });
+    } catch (e) {
+      setError("Couldn't reach the server.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <h2 className="text-xl font-bold">
+        {phase === "email" ? "Let's verify it's you" : "Enter your code"}
+      </h2>
+      <p className="mt-1 text-sm text-neutral-500">
+        {phase === "email"
+          ? "We need this to keep your orders and delivery details secure."
+          : `Check ${emailInput} for a 4-digit code (and check spam, just in case).`}
+      </p>
+
+      {phase === "email" && (
+        <div className="mt-5">
+          <label className="mb-1 block text-sm font-semibold">Email address</label>
+          <input
+            value={emailInput}
+            onChange={(e) => setEmailInput(e.target.value)}
+            placeholder="you@example.com"
+            type="email"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-lime-400"
+          />
+          <label className="mb-1 mt-3 block text-sm font-semibold">Phone number</label>
+          <input
+            value={phoneInput}
+            onChange={(e) => setPhoneInput(e.target.value)}
+            placeholder="0801 234 5678"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-lime-400"
+          />
+          <label className="mb-1 mt-3 block text-sm font-semibold">Your name</label>
+          <input
+            value={nameInput}
+            onChange={(e) => setNameInput(e.target.value)}
+            placeholder="Full name"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-lime-400"
+          />
+          {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+          <button
+            onClick={sendCode}
+            disabled={busy}
+            className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 disabled:opacity-50"
+          >
+            {busy ? "Sending…" : "Send verification code"}
+          </button>
+        </div>
+      )}
+
+      {phase === "code" && (
+        <div className="mt-5">
+          <input
+            value={codeInput}
+            onChange={(e) => setCodeInput(e.target.value)}
+            placeholder="1234"
+            inputMode="numeric"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 p-3 text-center font-mono text-lg tracking-widest outline-none focus:border-lime-400"
+          />
+          {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+          <button
+            onClick={verifyCode}
+            disabled={busy}
+            className="mt-4 w-full rounded-lg bg-lime-400 py-3 font-bold text-neutral-900 disabled:opacity-50"
+          >
+            {busy ? "Verifying…" : "Verify & continue"}
+          </button>
+          <button onClick={() => setPhase("email")} className="mt-2 w-full text-sm text-neutral-500 hover:text-neutral-300">
+            ← Change email
+          </button>
+        </div>
       )}
     </div>
   );
