@@ -232,6 +232,9 @@ function OrderFlow() {
   const [errandType, setErrandType] = useState(null);
   const [errandItems, setErrandItems] = useState("");
   const [express, setExpress] = useState(false);
+  const [scheduled, setScheduled] = useState(false);
+  const [scheduledDateTime, setScheduledDateTime] = useState("");
+  const [scheduleError, setScheduleError] = useState("");
   const [farBusstop, setFarBusstop] = useState(false);
   const [location, setLocation] = useState("");
   const [customerName, setCustomerName] = useState("");
@@ -259,6 +262,25 @@ function OrderFlow() {
 
   const zone = ZONES.find((z) => z.id === zoneId);
 
+  const validateSchedule = (value) => {
+    if (!value) return "Please pick a date and time.";
+    const picked = new Date(value);
+    const now = new Date();
+    const minAllowed = new Date(now.getTime() + 60 * 60 * 1000);
+    if (picked < minAllowed) return "Scheduled deliveries need at least 1 hour's notice.";
+    if (picked.getHours() < 9 || picked.getHours() >= 21) return "We only operate 9am–9pm. Please pick a time in that window.";
+    const isSameDay = picked.toDateString() === now.toDateString();
+    if (isSameDay && picked.getHours() >= 20) return "Same-day scheduling closes at 8pm. Pick an earlier time today, or a time tomorrow.";
+    return "";
+  };
+
+  const formatScheduled = (value) => {
+    if (!value) return "";
+    const d = new Date(value);
+    return d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short", year: "numeric" }) +
+      " — " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  };
+
   const pricing = useMemo(() => {
     if (!zone) return null;
     const distanceAdd = farBusstop ? DISTANCE_MODIFIER : 0;
@@ -276,7 +298,7 @@ function OrderFlow() {
   }, [zone, service, weight, errandType, express, farBusstop]);
 
   const canAdvance = () => {
-    if (step === 0) return !!service;
+    if (step === 0) return !!service && (!scheduled || (scheduledDateTime && !validateSchedule(scheduledDateTime)));
     if (step === 1) return !!zoneId && (service === "B2C" || !!weight) && (service === "B2B" || !!errandType);
     if (step === 2)
       return (
@@ -297,6 +319,9 @@ function OrderFlow() {
     setErrandType(null);
     setErrandItems("");
     setExpress(false);
+    setScheduled(false);
+    setScheduledDateTime("");
+    setScheduleError("");
     setFarBusstop(false);
     setLocation("");
     setCustomerName("");
@@ -407,9 +432,66 @@ function OrderFlow() {
                 </button>
               </div>
               <label className="mt-6 flex items-center gap-2 text-sm text-neutral-400">
-                <input type="checkbox" checked={express} onChange={(e) => setExpress(e.target.checked)} className="accent-lime-400" />
+                <input
+                  type="checkbox"
+                  checked={express}
+                  onChange={(e) => {
+                    setExpress(e.target.checked);
+                    if (e.target.checked) {
+                      setScheduled(false);
+                      setScheduledDateTime("");
+                      setScheduleError("");
+                    }
+                  }}
+                  className="accent-lime-400"
+                />
                 Express delivery (+{naira(EXPRESS_SURCHARGE)}, priority handling)
               </label>
+
+              <label className="mt-3 flex items-center gap-2 text-sm text-neutral-400">
+                <input
+                  type="checkbox"
+                  checked={scheduled}
+                  onChange={(e) => {
+                    setScheduled(e.target.checked);
+                    if (e.target.checked) setExpress(false);
+                    else {
+                      setScheduledDateTime("");
+                      setScheduleError("");
+                    }
+                  }}
+                  className="accent-lime-400"
+                />
+                Schedule for later (pick a date & time)
+              </label>
+
+              {scheduled && (
+                <div className="mt-3 rounded-lg border border-neutral-700 bg-neutral-900 p-4">
+                  <label className="mb-1 block text-xs font-semibold text-neutral-400">Delivery date & time</label>
+                  <input
+                    type="datetime-local"
+                    value={scheduledDateTime}
+                    onChange={(e) => {
+                      setScheduledDateTime(e.target.value);
+                      setScheduleError(validateSchedule(e.target.value));
+                    }}
+                    className="w-full rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-sm text-neutral-100 outline-none focus:border-lime-400"
+                  />
+                  <p className="mt-2 text-xs text-neutral-500">
+                    Available daily 9am–9pm. Needs at least 1 hour's notice. Same-day scheduling closes at 8pm.
+                  </p>
+                  {scheduleError && (
+                    <div className="mt-2 rounded-lg border border-red-500/50 bg-red-500/10 p-2 text-xs text-red-300">
+                      {scheduleError}
+                    </div>
+                  )}
+                  {scheduledDateTime && !scheduleError && (
+                    <div className="mt-2 text-xs" style={{ color: "#C4F135" }}>
+                      ✓ Scheduled for {formatScheduled(scheduledDateTime)}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -555,6 +637,7 @@ function OrderFlow() {
                 {pricing.distanceAdd > 0 && <Row label="Distance modifier" value={`+${naira(pricing.distanceAdd)}`} />}
                 {pricing.expressAdd > 0 && <Row label="Express surcharge" value={`+${naira(pricing.expressAdd)}`} />}
                 <Row label="Total" value={naira(pricing.total)} bold />
+                {scheduled && scheduledDateTime && <Row label="Scheduled for" value={formatScheduled(scheduledDateTime)} />}
               </div>
             </div>
           )}
@@ -593,6 +676,7 @@ function OrderFlow() {
                           errandType: service === "B2C" ? errandType : undefined,
                           errandItems: service === "B2C" ? errandItems : undefined,
                           express,
+                          scheduledTime: scheduled && scheduledDateTime ? formatScheduled(scheduledDateTime) : undefined,
                           farBusstop,
                           location,
                           customerName,
