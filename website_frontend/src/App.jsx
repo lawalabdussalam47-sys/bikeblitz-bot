@@ -248,23 +248,28 @@ function OrderFlow() {
   const [showAccount, setShowAccount] = useState(false);
   const [sessionToken, setSessionToken] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_token") : null));
   const [accountPhone, setAccountPhone] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_phone") : null));
+  const [accountEmail, setAccountEmail] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_email") : null));
   const [accountName, setAccountName] = useState(() => (typeof window !== "undefined" ? localStorage.getItem("bb_name") : null));
 
-  const handleLoggedIn = ({ token, phone, name }) => {
+  const handleLoggedIn = ({ token, phone, email, name }) => {
     localStorage.setItem("bb_token", token);
-    localStorage.setItem("bb_phone", phone);
+    localStorage.setItem("bb_phone", phone || "");
+    localStorage.setItem("bb_email", email || "");
     localStorage.setItem("bb_name", name || "");
     setSessionToken(token);
-    setAccountPhone(phone);
+    setAccountPhone(phone || "");
+    setAccountEmail(email || "");
     setAccountName(name || "");
   };
 
   const handleLogout = () => {
     localStorage.removeItem("bb_token");
     localStorage.removeItem("bb_phone");
+    localStorage.removeItem("bb_email");
     localStorage.removeItem("bb_name");
     setSessionToken(null);
     setAccountPhone(null);
+    setAccountEmail(null);
     setAccountName(null);
   };
 
@@ -791,6 +796,7 @@ function OrderFlow() {
         <AccountPanel
           sessionToken={sessionToken}
           accountPhone={accountPhone}
+          accountEmail={accountEmail}
           accountName={accountName}
           onLoggedIn={handleLoggedIn}
           onLogout={handleLogout}
@@ -802,8 +808,9 @@ function OrderFlow() {
   );
 }
 
-function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onLogout, onReorder, onClose }) {
-  const [phase, setPhase] = useState(sessionToken ? "history" : "phone"); // phone | code | history
+function AccountPanel({ sessionToken, accountPhone, accountEmail, accountName, onLoggedIn, onLogout, onReorder, onClose }) {
+  const [phase, setPhase] = useState(sessionToken ? "history" : "email"); // email | code | history
+  const [emailInput, setEmailInput] = useState("");
   const [phoneInput, setPhoneInput] = useState("");
   const [nameInput, setNameInput] = useState("");
   const [codeInput, setCodeInput] = useState("");
@@ -822,12 +829,15 @@ function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onL
   }, [phase, sessionToken]);
 
   const sendCode = async () => {
-    if (!phoneInput.trim()) { setError("Enter your phone number."); return; }
+    if (!emailInput.trim() || !/\S+@\S+\.\S+/.test(emailInput.trim())) {
+      setError("Enter a valid email address.");
+      return;
+    }
     setBusy(true); setError("");
     try {
       const res = await fetch(`${API_BASE}/api/auth/send-otp`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone: phoneInput.trim() }),
+        body: JSON.stringify({ email: emailInput.trim() }),
       });
       const data = await res.json();
       if (!res.ok) { setError(data.error || "Couldn't send code."); setBusy(false); return; }
@@ -844,11 +854,16 @@ function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onL
     try {
       const res = await fetch(`${API_BASE}/api/auth/verify-otp`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone: phoneInput.trim(), code: codeInput.trim(), name: nameInput.trim() }),
+        body: JSON.stringify({
+          email: emailInput.trim(),
+          code: codeInput.trim(),
+          name: nameInput.trim(),
+          phone: phoneInput.trim(),
+        }),
       });
       const data = await res.json();
       if (!res.ok) { setError(data.error || "That code didn't work."); setBusy(false); return; }
-      onLoggedIn({ token: data.token, phone: data.phone, name: data.name || nameInput.trim() });
+      onLoggedIn({ token: data.token, email: data.email, phone: data.phone, name: data.name || nameInput.trim() });
       setPhase("history");
     } catch (e) {
       setError("Couldn't reach the server.");
@@ -867,9 +882,17 @@ function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onL
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-200">✕</button>
         </div>
 
-        {phase === "phone" && (
+        {phase === "email" && (
           <div>
-            <label className="mb-1 block text-sm font-semibold">Phone number</label>
+            <label className="mb-1 block text-sm font-semibold">Email address</label>
+            <input
+              value={emailInput}
+              onChange={(e) => setEmailInput(e.target.value)}
+              placeholder="you@example.com"
+              type="email"
+              className="w-full rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-sm outline-none focus:border-lime-400"
+            />
+            <label className="mb-1 mt-3 block text-sm font-semibold">Phone number</label>
             <input
               value={phoneInput}
               onChange={(e) => setPhoneInput(e.target.value)}
@@ -896,7 +919,7 @@ function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onL
 
         {phase === "code" && (
           <div>
-            <p className="mb-3 text-sm text-neutral-400">Enter the code sent to {phoneInput}</p>
+            <p className="mb-3 text-sm text-neutral-400">Enter the code sent to {emailInput}</p>
             <input
               value={codeInput}
               onChange={(e) => setCodeInput(e.target.value)}
@@ -912,15 +935,15 @@ function AccountPanel({ sessionToken, accountPhone, accountName, onLoggedIn, onL
             >
               {busy ? "Verifying…" : "Verify & sign in"}
             </button>
-            <button onClick={() => setPhase("phone")} className="mt-2 w-full text-sm text-neutral-500 hover:text-neutral-300">
-              ← Change number
+            <button onClick={() => setPhase("email")} className="mt-2 w-full text-sm text-neutral-500 hover:text-neutral-300">
+              ← Change email
             </button>
           </div>
         )}
 
         {phase === "history" && (
           <div>
-            <p className="mb-3 text-sm text-neutral-400">Signed in as {accountName || accountPhone}</p>
+            <p className="mb-3 text-sm text-neutral-400">Signed in as {accountName || accountEmail || accountPhone}</p>
             {orders === null && <p className="text-sm text-neutral-500">Loading your orders…</p>}
             {orders && orders.length === 0 && <p className="text-sm text-neutral-500">No past orders yet.</p>}
             {orders && orders.length > 0 && (
