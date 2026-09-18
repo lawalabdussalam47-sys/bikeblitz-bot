@@ -10,7 +10,7 @@ from pricing import calculate_total, ZONE_PRICES, ERRAND_FEES
 import sheets
 import paystack
 import telegram_notify
-import otp
+import email_otp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -19,22 +19,6 @@ app = Flask(__name__)
 CORS(app)  # allow the frontend (hosted separately) to call this API
 
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:5173")
-
-# In-memory pinId store, keyed by normalized phone. Fine for now since Render's
-# free tier runs a single instance — if you ever scale to multiple instances,
-# this needs to move to the Customers sheet or similar shared storage instead.
-_pending_otps = {}
-
-
-def _normalize_phone(phone):
-    """Converts a Nigerian phone number to the international format Termii expects
-    (234XXXXXXXXXX, no '+', no leading 0)."""
-    digits = "".join(c for c in (phone or "") if c.isdigit())
-    if digits.startswith("0"):
-        digits = "234" + digits[1:]
-    elif not digits.startswith("234"):
-        digits = "234" + digits
-    return digits
 
 
 def generate_pickup_code():
@@ -254,7 +238,7 @@ def order_history():
         return jsonify({"error": "Not logged in."}), 401
     customer = sheets.get_customer_by_token(token)
     if customer is None:
-        return jsonify({"error": "Session expired — please verify your phone again."}), 401
+        return jsonify({"error": "Session expired — please verify your email again."}), 401
 
     phone = customer.get("Phone")
     ws = sheets.get_weborders_sheet()
@@ -269,7 +253,7 @@ def order_history():
             if not row:
                 continue
             record = dict(zip(headers, row))
-            if record.get("Phone") == phone:
+            if phone and record.get("Phone") == phone:
                 orders.append({
                     "reference": record.get("Reference"),
                     "service": record.get("Service"),
@@ -288,49 +272,49 @@ def order_history():
         return jsonify({"error": "Couldn't load order history right now."}), 500
 
 
-# ---------- Customer identity (phone + OTP via Termii) ----------
+# ---------- Customer identity (email + code, sent via Gmail SMTP) ----------
+# Switched from SMS OTP (Termii) to email after discovering Termii requires
+# business KYC (CAC registration) before activating Nigeria for OTP sending.
+# Phone is still collected and stored (see sheets.get_or_create_customer) so
+# order history can be matched against WebOrders, which is keyed by phone.
 
 @app.route("/api/auth/send-otp", methods=["POST"])
 def send_otp_route():
     body = request.get_json(force=True) or {}
-    phone = (body.get("phone") or "").strip()
-    if not phone:
-        return jsonify({"error": "Phone number is required."}), 400
+    email = (body.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email address is required."}), 400
 
-    digits = _normalize_phone(phone)
-    pin_id, error = otp.send_otp(digits)
-    if error:
+    ok, error = email_otp.send_code(email)
+    if not ok:
         return jsonify({"error": error}), 502
-
-    _pending_otps[digits] = pin_id
     return jsonify({"ok": True})
 
 
 @app.route("/api/auth/verify-otp", methods=["POST"])
 def verify_otp_route():
     body = request.get_json(force=True) or {}
-    phone = (body.get("phone") or "").strip()
-    pin = (body.get("code") or "").strip()
+    email = (body.get("email") or "").strip().lower()
+    code = (body.get("code") or "").strip()
     name = (body.get("name") or "").strip()
+    phone = (body.get("phone") or "").strip()
 
-    digits = _normalize_phone(phone)
-    pin_id = _pending_otps.get(digits)
-    if not pin_id:
-        return jsonify({"error": "No verification code was sent to this number — request one first."}), 400
+    if not email or not code:
+        return jsonify({"error": "Email and code are both required."}), 400
 
-    verified, error = otp.verify_otp(pin_id, pin)
+    verified, error = email_otp.verify_code(email, code)
     if not verified:
         return jsonify({"error": error or "That code is incorrect."}), 400
 
-    _pending_otps.pop(digits, None)
-    customer = sheets.get_or_create_customer(digits, name)
+    customer = sheets.get_or_create_customer(email, phone, name)
     if customer is None:
         return jsonify({"error": "Verified, but couldn't set up your account — try again."}), 500
 
     return jsonify({
         "token": customer.get("Session Token"),
-        "phone": digits,
-        "name": customer.get("Name", ""),
+        "email": email,
+        "phone": customer.get("Phone", phone),
+        "name": customer.get("Name", name),
     })
 
 
@@ -341,9 +325,10 @@ def auth_me():
         return jsonify({"error": "Not logged in."}), 401
     customer = sheets.get_customer_by_token(token)
     if customer is None:
-        return jsonify({"error": "Session expired — please verify your phone again."}), 401
+        return jsonify({"error": "Session expired — please verify your email again."}), 401
     return jsonify({
-        "phone": customer.get("Phone"),
+        "email": customer.get("Email"),
+        "phone": customer.get("Phone", ""),
         "name": customer.get("Name", ""),
         "walletBalance": customer.get("Wallet Balance", 0),
     })
