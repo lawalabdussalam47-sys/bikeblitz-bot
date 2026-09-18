@@ -247,6 +247,47 @@ def confirm_delivery(reference):
     return jsonify({"reference": reference, "status": "Delivered"})
 
 
+@app.route("/api/orders/history", methods=["GET"])
+def order_history():
+    token = request.headers.get("X-Session-Token")
+    if not token:
+        return jsonify({"error": "Not logged in."}), 401
+    customer = sheets.get_customer_by_token(token)
+    if customer is None:
+        return jsonify({"error": "Session expired — please verify your phone again."}), 401
+
+    phone = customer.get("Phone")
+    ws = sheets.get_weborders_sheet()
+    if ws is None:
+        return jsonify({"orders": []})
+
+    try:
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        orders = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            record = dict(zip(headers, row))
+            if record.get("Phone") == phone:
+                orders.append({
+                    "reference": record.get("Reference"),
+                    "service": record.get("Service"),
+                    "zone": record.get("Zone"),
+                    "location": record.get("Location"),
+                    "errandItems": record.get("Errand Items", ""),
+                    "deliveryType": record.get("Delivery Type"),
+                    "total": record.get("Total"),
+                    "status": record.get("Status"),
+                    "timestamp": record.get("Timestamp"),
+                })
+        orders.reverse()  # most recent first
+        return jsonify({"orders": orders[:20]})
+    except Exception:
+        logger.exception("Failed to fetch order history")
+        return jsonify({"error": "Couldn't load order history right now."}), 500
+
+
 # ---------- Customer identity (phone + OTP via Termii) ----------
 
 @app.route("/api/auth/send-otp", methods=["POST"])
