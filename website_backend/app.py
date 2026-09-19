@@ -76,6 +76,9 @@ def create_order():
     if not customer_name or not phone or not email or not location:
         return jsonify({"error": "Name, phone, email, and location are all required."}), 400
 
+    if sheets.is_blocked(phone):
+        return jsonify({"error": "This account is restricted from placing orders. Contact us if you believe this is a mistake."}), 403
+
     total, breakdown = calculate_total(service, zone, weight, errand_type, express, far_busstop)
     if total is None:
         return jsonify({"error": breakdown}), 400
