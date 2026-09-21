@@ -220,3 +220,21 @@ def get_customer_by_token(token):
     except Exception:
         logger.exception("Failed to look up customer by token")
         return None
+
+
+def is_blocked(identifier):
+    """Checks the shared 'Blocklist' sheet (same one bikeblitz_bot.py writes to)
+    for a match. The bot blocks by Telegram ID, but that column is really just a
+    generic identifier string — an admin can also add a phone number there to
+    block a web-only customer who has no Telegram ID. Matches against either the
+    'Telegram ID' column value directly."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return False
+    try:
+        ws = ss.worksheet("Blocklist")
+        records = ws.get_all_records()
+        return any(str(r.get("Telegram ID", "")) == str(identifier) for r in records)
+    except Exception:
+        logger.exception("Failed to check blocklist")
+        return False
