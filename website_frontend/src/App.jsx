@@ -48,6 +48,9 @@ function TrackOrder({ reference }) {
   const [submitting, setSubmitting] = useState(false);
   const [deliverError, setDeliverError] = useState("");
   const [justDelivered, setJustDelivered] = useState(false);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -115,7 +118,28 @@ function TrackOrder({ reference }) {
     }
   };
 
-  const canConfirmDelivery = order && order.status !== "Delivered" && order.status !== "Pending Payment";
+  const canConfirmDelivery = order && order.status !== "Delivered" && order.status !== "Pending Payment" && order.status !== "Cancelled";
+  const canCancel = order && order.status !== "Delivered" && order.status !== "Cancelled";
+
+  const cancelOrder = async () => {
+    setCancelling(true);
+    setCancelError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/orders/${reference}/cancel`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setCancelError(data.error || "Couldn't cancel this order — try again.");
+        setCancelling(false);
+        return;
+      }
+      setShowCancelConfirm(false);
+      setOrder((prev) => ({ ...prev, status: "Cancelled" }));
+    } catch (err) {
+      setCancelError("Couldn't reach the server. Check your connection and try again.");
+    } finally {
+      setCancelling(false);
+    }
+  };
 
   return (
     <div className="min-h-screen w-full bg-neutral-900 px-5 py-16 text-neutral-100">
@@ -164,6 +188,52 @@ function TrackOrder({ reference }) {
               <div className="mt-6 rounded-lg border border-lime-400 bg-lime-400/10 p-4">
                 <div className="font-semibold" style={{ color: "#C4F135" }}>
                   ✓ Marked as delivered{justDelivered ? " — thank you!" : ""}
+                </div>
+              </div>
+            )}
+
+            {order.status === "Cancelled" && (
+              <div className="mt-6 rounded-lg border border-red-500/50 bg-red-500/10 p-4">
+                <div className="font-semibold text-red-300">
+                  This order has been cancelled.
+                </div>
+              </div>
+            )}
+
+            {canCancel && !showCancelConfirm && (
+              <button
+                onClick={() => setShowCancelConfirm(true)}
+                className="mt-5 text-xs text-neutral-500 underline hover:text-red-300"
+              >
+                Cancel this order
+              </button>
+            )}
+
+            {canCancel && showCancelConfirm && (
+              <div className="mt-5 rounded-lg border border-red-500/40 bg-red-500/5 p-4">
+                <p className="text-sm text-neutral-300">
+                  Are you sure you want to cancel this order? This can't be undone.
+                </p>
+                {cancelError && (
+                  <div className="mt-3 rounded-lg border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-300">
+                    {cancelError}
+                  </div>
+                )}
+                <div className="mt-3 flex gap-2">
+                  <button
+                    onClick={cancelOrder}
+                    disabled={cancelling}
+                    className="flex-1 rounded-lg bg-red-500/90 py-2 text-sm font-bold text-white disabled:opacity-50"
+                  >
+                    {cancelling ? "Cancelling…" : "Yes, cancel it"}
+                  </button>
+                  <button
+                    onClick={() => setShowCancelConfirm(false)}
+                    disabled={cancelling}
+                    className="flex-1 rounded-lg border border-neutral-700 py-2 text-sm text-neutral-300"
+                  >
+                    Never mind
+                  </button>
                 </div>
               </div>
             )}
