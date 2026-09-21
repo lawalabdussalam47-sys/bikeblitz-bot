@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import logo from "./assets/IMG_7232.png";
 
 // Live backend URL — update this if you ever redeploy the backend elsewhere.
@@ -197,6 +198,20 @@ function TrackOrder({ reference }) {
             <p className="mt-2 text-sm text-neutral-500">
               {order.zone} — {naira(Number(order.total || 0))}
             </p>
+
+            {order.status === "Claimed" && order.riderLat && order.riderLng && (
+              <div className="mt-5 overflow-hidden rounded-lg border border-neutral-800">
+                <iframe
+                  title="Rider location"
+                  className="h-48 w-full"
+                  frameBorder="0"
+                  src={`https://www.openstreetmap.org/export/embed.html?bbox=${Number(order.riderLng) - 0.006}%2C${Number(order.riderLat) - 0.006}%2C${Number(order.riderLng) + 0.006}%2C${Number(order.riderLat) + 0.006}&layer=mapnik&marker=${order.riderLat}%2C${order.riderLng}`}
+                />
+                <div className="bg-neutral-800/60 px-3 py-2 text-xs text-neutral-500">
+                  {order.riderLocationUpdatedAt ? `Last updated: ${order.riderLocationUpdatedAt}` : "Waiting for rider to share location…"}
+                </div>
+              </div>
+            )}
 
             {order.pickupCode && order.status !== "Delivered" && (
               <div className="mt-5 rounded-lg border border-lime-400/50 bg-lime-400/10 p-4">
