@@ -196,6 +196,9 @@ def order_status(reference):
         "zone": order.get("Zone"),
         "total": order.get("Total"),
         "pickupCode": order.get("Pickup Code") or None,
+        "riderLat": order.get("Rider Lat") or None,
+        "riderLng": order.get("Rider Lng") or None,
+        "riderLocationUpdatedAt": order.get("Rider Location Updated At") or None,
     })
 
 
