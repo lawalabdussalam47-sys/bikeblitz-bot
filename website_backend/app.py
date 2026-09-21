@@ -276,6 +276,57 @@ def cancel_order(reference):
     return jsonify({"reference": reference, "status": "Cancelled"})
 
 
+@app.route("/api/orders/<reference>/report-not-arrived", methods=["POST"])
+def report_not_arrived(reference):
+    """Customer reports a claimed order hasn't arrived. Releases it from the
+    current rider, tracks the reassignment against that rider (same Riders sheet
+    the bot uses), and reopens the order to the rider group as a fresh broadcast."""
+    order = sheets.get_web_order(reference)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+
+    status = order.get("Status")
+    if status == "Delivered":
+        return jsonify({"error": "This order has already been delivered."}), 400
+    if status == "Cancelled":
+        return jsonify({"error": "This order has been cancelled."}), 400
+
+    old_rider_id = order.get("Rider ID")
+    old_rider_name = order.get("Rider Name", "the assigned rider")
+    if not old_rider_id:
+        return jsonify({"error": "No rider has been assigned to this order yet."}), 400
+
+    zone = order.get("Zone", "N/A")
+    location = order.get("Location", "N/A")
+
+    sheets.update_web_order(reference, **{"Rider ID": "", "Rider Name": "", "Status": "Paid"})
+
+    reassignment_count = sheets.record_rider_reassignment(old_rider_id)
+    telegram_notify.notify_rider_order_reassigned(old_rider_id, reference, zone, location)
+
+    new_broadcast_id = telegram_notify.broadcast_web_order_to_riders(
+        reference=reference,
+        service=order.get("Service"),
+        zone=zone,
+        location=location,
+        errand_items=order.get("Errand Items", ""),
+        delivery_type=order.get("Delivery Type"),
+        total=int(order.get("Total", 0) or 0),
+    )
+    if new_broadcast_id:
+        sheets.update_web_order(reference, **{"Broadcast Message ID": new_broadcast_id})
+
+    telegram_notify.notify_admin(
+        f"🔄 *Web Order Reassigned*\n\n"
+        f"Reference: `{reference}`\n"
+        f"Previous rider: {old_rider_name} ({old_rider_id}) — reassignment count: {reassignment_count}\n"
+        f"🗺️ {zone} — {location}\n\n"
+        "Order has been reopened to the rider group."
+    )
+
+    return jsonify({"reference": reference, "status": "Paid"})
+
+
 @app.route("/api/orders/history", methods=["GET"])
 def order_history():
     token = request.headers.get("X-Session-Token")
