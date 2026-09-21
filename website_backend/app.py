@@ -234,6 +234,48 @@ def confirm_delivery(reference):
     return jsonify({"reference": reference, "status": "Delivered"})
 
 
+@app.route("/api/orders/<reference>/cancel", methods=["POST"])
+def cancel_order(reference):
+    """Customer-facing cancellation. Only allowed before delivery. If a rider had
+    already claimed it, they're notified directly. If it hadn't been claimed yet,
+    the original rider-group broadcast is edited to remove the Accept button so
+    no one tries to act on a dead order. Admin is notified either way — a refund
+    may need manual handling for orders that were already paid."""
+    order = sheets.get_web_order(reference)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+
+    status = order.get("Status")
+    if status == "Delivered":
+        return jsonify({"error": "This order has already been delivered and can't be cancelled."}), 400
+    if status == "Cancelled":
+        return jsonify({"error": "This order is already cancelled."}), 400
+
+    sheets.update_web_order(reference, Status="Cancelled")
+
+    zone = order.get("Zone", "N/A")
+    location = order.get("Location", "N/A")
+    rider_id = order.get("Rider ID")
+
+    if rider_id:
+        telegram_notify.notify_rider_order_cancelled(rider_id, reference, zone, location)
+    else:
+        broadcast_id = order.get("Broadcast Message ID")
+        if broadcast_id:
+            telegram_notify.edit_broadcast_cancelled(broadcast_id, reference)
+
+    refund_note = " A refund may need to be processed manually." if status in ("Paid", "Claimed") else ""
+    telegram_notify.notify_admin(
+        f"⚠️ *Order Cancelled by Customer*\n\n"
+        f"Reference: `{reference}`\n"
+        f"🗺️ {zone} — {location}\n"
+        f"💳 ₦{int(order.get('Total', 0) or 0):,}\n\n"
+        f"Previous status: {status}.{refund_note}"
+    )
+
+    return jsonify({"reference": reference, "status": "Cancelled"})
+
+
 @app.route("/api/orders/history", methods=["GET"])
 def order_history():
     token = request.headers.get("X-Session-Token")
