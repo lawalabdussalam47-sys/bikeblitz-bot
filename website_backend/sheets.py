@@ -238,3 +238,26 @@ def is_blocked(identifier):
     except Exception:
         logger.exception("Failed to check blocklist")
         return False
+
+
+def record_rider_reassignment(rider_id):
+    """Increments a rider's reassignment/no-show count in the shared 'Riders'
+    sheet (column J), same one bikeblitz_bot.py writes to for bot-native orders.
+    Doesn't create the column/sheet if missing — the bot already manages that
+    structure, this just adds to it. Returns the new count, or 0 on failure."""
+    ss = get_spreadsheet()
+    if ss is None:
+        return 0
+    try:
+        ws = ss.worksheet("Riders")
+        rows = ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) > 1 and row[1] == str(rider_id):
+                current = int(row[9]) if len(row) > 9 and str(row[9]).isdigit() else 0
+                new_count = current + 1
+                ws.update(f"J{idx}", [[new_count]])
+                return new_count
+        return 0
+    except Exception:
+        logger.exception("Failed to record rider reassignment")
+        return 0
