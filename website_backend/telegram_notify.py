@@ -61,6 +61,8 @@ def notify_admin(text):
     if not ADMIN_CHAT_ID:
         return
     _post("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+
+
 def send_delivery_proof(reference, photo_bytes, filename, zone, location):
     if not API_BASE:
         logger.warning("BOT_TOKEN not configured — skipping delivery proof notification")
@@ -89,3 +91,29 @@ def send_delivery_proof(reference, photo_bytes, filename, zone, location):
     except Exception:
         logger.exception("Failed to send delivery proof photo to Telegram")
         return None
+
+
+def notify_rider_order_cancelled(rider_id, reference, zone, location):
+    """DMs a rider that a web order they'd already claimed has been cancelled by
+    the customer, so they know to stop before heading out or mid-delivery."""
+    text = (
+        "⚠️ *Order Cancelled*\n\n"
+        f"Reference: `{reference}`\n"
+        f"🗺️ {zone} — {location}\n\n"
+        "The customer cancelled this order. Please don't proceed with it."
+    )
+    _post("sendMessage", {"chat_id": rider_id, "text": text, "parse_mode": "Markdown"})
+
+
+def edit_broadcast_cancelled(message_id, reference):
+    """Edits the original rider-group broadcast message to show an order was
+    cancelled before anyone claimed it, removing the Accept button so no one
+    tries to act on a dead order."""
+    if not message_id:
+        return None
+    return _post("editMessageText", {
+        "chat_id": RIDER_GROUP_CHAT_ID,
+        "message_id": message_id,
+        "text": f"❌ This order (`{reference}`) was cancelled by the customer before being claimed.",
+        "parse_mode": "Markdown",
+    })
