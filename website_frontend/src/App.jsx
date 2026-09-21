@@ -51,6 +51,10 @@ function TrackOrder({ reference }) {
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState("");
+  const [showReportConfirm, setShowReportConfirm] = useState(false);
+  const [reporting, setReporting] = useState(false);
+  const [reportError, setReportError] = useState("");
+  const [justReported, setJustReported] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,6 +124,28 @@ function TrackOrder({ reference }) {
 
   const canConfirmDelivery = order && order.status !== "Delivered" && order.status !== "Pending Payment" && order.status !== "Cancelled";
   const canCancel = order && order.status !== "Delivered" && order.status !== "Cancelled";
+  const canReportNotArrived = order && order.status === "Claimed" && order.riderName;
+
+  const reportNotArrived = async () => {
+    setReporting(true);
+    setReportError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/orders/${reference}/report-not-arrived`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setReportError(data.error || "Couldn't report this — try again.");
+        setReporting(false);
+        return;
+      }
+      setJustReported(true);
+      setShowReportConfirm(false);
+      setOrder((prev) => ({ ...prev, status: "Paid", riderName: null }));
+    } catch (err) {
+      setReportError("Couldn't reach the server. Check your connection and try again.");
+    } finally {
+      setReporting(false);
+    }
+  };
 
   const cancelOrder = async () => {
     setCancelling(true);
@@ -230,6 +256,50 @@ function TrackOrder({ reference }) {
                   <button
                     onClick={() => setShowCancelConfirm(false)}
                     disabled={cancelling}
+                    className="flex-1 rounded-lg border border-neutral-700 py-2 text-sm text-neutral-300"
+                  >
+                    Never mind
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {canReportNotArrived && justReported && (
+              <div className="mt-5 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+                Got it — we've reopened your delivery to other riders. You'll be notified once someone new picks it up.
+              </div>
+            )}
+
+            {canReportNotArrived && !justReported && !showReportConfirm && (
+              <button
+                onClick={() => setShowReportConfirm(true)}
+                className="mt-3 block text-xs text-neutral-500 underline hover:text-amber-300"
+              >
+                My delivery hasn't arrived yet
+              </button>
+            )}
+
+            {canReportNotArrived && showReportConfirm && (
+              <div className="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4">
+                <p className="text-sm text-neutral-300">
+                  This will release your order from {order.riderName} and reopen it to other riders. Continue?
+                </p>
+                {reportError && (
+                  <div className="mt-3 rounded-lg border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-300">
+                    {reportError}
+                  </div>
+                )}
+                <div className="mt-3 flex gap-2">
+                  <button
+                    onClick={reportNotArrived}
+                    disabled={reporting}
+                    className="flex-1 rounded-lg bg-amber-500/90 py-2 text-sm font-bold text-neutral-900 disabled:opacity-50"
+                  >
+                    {reporting ? "Reopening…" : "Yes, reopen it"}
+                  </button>
+                  <button
+                    onClick={() => setShowReportConfirm(false)}
+                    disabled={reporting}
                     className="flex-1 rounded-lg border border-neutral-700 py-2 text-sm text-neutral-300"
                   >
                     Never mind
