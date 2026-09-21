@@ -105,7 +105,17 @@ def notify_rider_order_cancelled(rider_id, reference, zone, location):
     _post("sendMessage", {"chat_id": rider_id, "text": text, "parse_mode": "Markdown"})
 
 
-def edit_broadcast_cancelled(message_id, reference):
+def notify_rider_order_reassigned(rider_id, reference, zone, location):
+    """DMs a rider that a web order they'd claimed has been reopened after the
+    customer reported it hasn't arrived, so they know to stop before proceeding."""
+    text = (
+        "⚠️ *Order Reassigned*\n\n"
+        f"Reference: `{reference}`\n"
+        f"🗺️ {zone} — {location}\n\n"
+        "The customer reported this hasn't arrived, so it's been reopened to other "
+        "riders. Please don't proceed with it."
+    )
+    _post("sendMessage", {"chat_id": rider_id, "text": text, "parse_mode": "Markdown"})
     """Edits the original rider-group broadcast message to show an order was
     cancelled before anyone claimed it, removing the Accept button so no one
     tries to act on a dead order."""
