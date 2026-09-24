@@ -650,6 +650,31 @@ def get_web_order(reference):
         return None, None
 
 
+def get_web_order_by_rider(rider_id):
+    """Find the active (not yet Delivered/Cancelled) web order currently claimed by this
+    rider, if any. Used to relay live location updates for website orders — those
+    customers don't have a Telegram chat to send a location message into directly, so
+    instead the rider's lat/lng gets written to the WebOrders sheet, and the tracking
+    page (which already polls every 5 seconds) picks it up from there. Returns
+    (reference, order_dict), or (None, None) if the rider has no active web order."""
+    try:
+        ws = get_weborders_sheet()
+        if ws is None:
+            return None, None
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        for row in rows[1:]:
+            if not row:
+                continue
+            record = dict(zip(headers, row))
+            if str(record.get("Rider ID", "")) == str(rider_id) and record.get("Status") not in ("Delivered", "Cancelled"):
+                return record.get("Reference"), record
+        return None, None
+    except Exception:
+        logger.exception("Failed to look up web order by rider")
+        return None, None
+
+
 def update_web_order(reference, **fields):
     """Updates specific columns of a web order row by header name."""
     try:
@@ -1427,30 +1452,60 @@ async def handle_verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_rider_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global location handler — relays a rider's shared (including live) location to
-    whichever customer they currently have an active claimed delivery for."""
+    whichever customer they currently have an active delivery for.
+
+    Handles both order sources, since the delivery mechanism differs for each:
+    - Bot-native orders: forwarded as a native Telegram location message straight to
+      the customer's chat.
+    - Website orders: the customer has no Telegram chat to receive a location message
+      in, so instead the rider's lat/lng/timestamp are written to the WebOrders sheet
+      (Rider Lat / Rider Lng / Rider Location Updated At columns), which the website's
+      tracking page already polls every 5 seconds and renders on an OpenStreetMap embed.
+
+    A rider could in principle have one of each kind active at once, so both checks run
+    independently rather than one short-circuiting the other."""
     message = update.effective_message
     if message is None or message.location is None:
         return
 
     rider_id = update.effective_user.id
+    handled = False
+
+    # Bot-native order — forward as a native Telegram location message
     claimed_orders = context.application.bot_data.get("claimed_orders", {})
-    order = None
+    native_order = None
     for o in claimed_orders.values():
         if o.get("rider_id") == rider_id and not o.get("delivered") and not o.get("cancelled"):
-            order = o
+            native_order = o
             break
 
-    if order is None:
-        return  # not a rider mid-delivery — ignore, let other handlers process it
+    if native_order is not None:
+        handled = True
+        try:
+            await context.bot.send_location(
+                chat_id=native_order.get("customer_id"),
+                latitude=message.location.latitude,
+                longitude=message.location.longitude,
+            )
+        except Exception:
+            logger.exception("Could not forward rider location to customer")
 
-    try:
-        await context.bot.send_location(
-            chat_id=order.get("customer_id"),
-            latitude=message.location.latitude,
-            longitude=message.location.longitude,
+    # Website order — write lat/lng to the WebOrders sheet for the tracking page to poll
+    reference, web_order = get_web_order_by_rider(rider_id)
+    if reference is not None:
+        handled = True
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_web_order(
+            reference,
+            **{
+                "Rider Lat": message.location.latitude,
+                "Rider Lng": message.location.longitude,
+                "Rider Location Updated At": now_str,
+            },
         )
-    except Exception:
-        logger.exception("Could not forward rider location to customer")
+
+    if not handled:
+        return  # not a rider mid-delivery — ignore, let other handlers process it
 
 
 async def handle_delivery_proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3815,7 +3870,9 @@ async def handle_web_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 Total: ₦{int(order.get('Total', 0) or 0):,}\n"
         f"👤 Customer: {order.get('Customer Name')} ({order.get('Phone', 'no phone on file')})\n\n"
         "This customer ordered on the website and paid by card/transfer — no payment collection needed. "
-        "Please reach out to confirm pickup/drop-off. Ride safe! 🚴"
+        "Please reach out to confirm pickup/drop-off. Ride safe! 🚴\n\n"
+        "📍 _Tip: share your live location in this chat (📎 → Location → Share Live Location) "
+        "so the customer can track you on the website's tracking page!_"
     )
     delivered_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Mark as Delivered", callback_data=f"webdelivered:{reference}")]
